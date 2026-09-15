@@ -707,23 +707,29 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process non-spec-decode part in mixed non-spec batches
         if split_non_spec:
-            assert mixed_qkv_non_spec is not None
             assert g_non_spec is not None
             assert beta_non_spec is not None
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            if fused_decode_qk is not None:
-                # Normalized by the fused kernel above; value only needs the slice.
-                # rearrange_mixed_qkv splits along the feature dim per token, so
-                # slicing the full-batch result equals rearranging the slice - and it
-                # skips that call's torch.cat copy as well.
-                query_decode, key_decode = fused_decode_qk
-                value_decode = value_non_spec[:, :num_decode_tokens]
-            else:
-                query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                    mixed_qkv_non_spec[:num_decode_tokens]
-                )
-                query_decode = l2norm_fwd(query_decode)
-                key_decode = l2norm_fwd(key_decode)
+            # causal_conv1d_fn emits head-first [N, T, D] (the BNSD layout the
+            # chunkgdn fused chunk kernel consumes), so the token dim is 1 and the
+            # feature dim is already split per head. npu_recurrent_gated_delta_rule
+            # wants TND, hence the transpose. unsqueeze(0) is load-bearing: the
+            # call below squeezes dim 0, which would eat the token dim whenever a
+            # single decode request makes num_decode_tokens == 1.
+            query_decode = (
+                query_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+            )
+            key_decode = (
+                key_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+            )
+            value_decode = (
+                value_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+            )
+            # chunkgdn use_qk_l2norm_in_kernel only covers the prefill op; the
+            # recurrent decode op needs q/k normalized by hand.
+            query_decode = l2norm_fwd(query_decode)
+            key_decode = l2norm_fwd(key_decode)
+
             core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                 query=query_decode.squeeze(0),
                 key=key_decode.squeeze(0),
