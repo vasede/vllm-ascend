@@ -43,6 +43,7 @@ from vllm_ascend.ops.triton.fla.utils import (
     preamble_fusion_enabled,
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 
 logger = init_logger(__name__)
 
@@ -233,8 +234,15 @@ def _chunk_gated_delta_rule_fla_npu(
             "which failed to import. Install it, or use gdn_fused_chunk_op='cann'."
         )
 
-    num_v_heads, head_v_dim = v.shape[2], v.shape[3]
-    num_k_heads, head_k_dim = k.shape[2], k.shape[3]
+    if q.dim() == 3:
+        q = q.unsqueeze(0)
+    if k.dim() == 3:
+        k = k.unsqueeze(0)
+    if v.dim() == 3:
+        v = v.unsqueeze(0)
+    
+    num_v_heads, head_v_dim = v.shape[1], v.shape[3]
+    num_k_heads, head_k_dim = k.shape[1], k.shape[3]
     # Fail loudly instead of letting the aclnn shape check raise a message that
     # gives no hint about which model config walked into an unsupported kernel.
     if head_k_dim != 128 or head_v_dim not in (128, 256):
@@ -249,13 +257,13 @@ def _chunk_gated_delta_rule_fla_npu(
         )
 
     # BSND -> BNSD. Phase 6 consumes q/k at Nk heads and expands to Nv internally.
-    q = q.transpose(1, 2).contiguous()  # [1, Nk, T, Dk]
-    k = k.transpose(1, 2).contiguous()  # [1, Nk, T, Dk]
-    v = v.transpose(1, 2).contiguous()  # [1, Nv, T, Dv]
+    # q = q.transpose(1, 2).contiguous()  # [1, Nk, T, Dk]
+    # k = k.transpose(1, 2).contiguous()  # [1, Nk, T, Dk]
+    # v = v.transpose(1, 2).contiguous()  # [1, Nv, T, Dv]
     # g/beta are already [B, T, Nv], which is the layout the kernel wants. g stays
     # fp32 and un-cumsummed; the kernel does the chunk-local cumsum itself.
-    g = g.to(torch.float32).contiguous()
-    beta = beta.to(v.dtype).contiguous()
+    # g = g.to(torch.float32).contiguous()
+    # beta = beta.to(v.dtype).contiguous()
 
     # ssm_state is [N, Nv, Dv, Dk] but the kernel state is [N, Nv, Dk, Dv].
     # fp32 state is not supported, and final_state comes back in the dtype of
@@ -455,25 +463,30 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             conv_weights_T = conv_weights.transpose(0, 1)
-            activation_num = 1 if self.activation else 0
+            # activation_num = 1 if self.activation else 0
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
-            output_spec = torch.empty_like(mixed_qkv_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
-                output_spec,
+
+            # output_spec = torch.empty_like(mixed_qkv_spec)
+            if spec_causal_conv1d_meta.cache_indices.dim() == 1:
+                conv_state_indices=spec_causal_conv1d_meta.cache_indices.contiguous()
+            elif spec_causal_conv1d_meta.cache_indices.dim() == 2:
+                conv_state_indices=spec_causal_conv1d_meta.cache_indices[:, 0].contiguous()
+            
+            output_spec = causal_conv1d_update(
                 mixed_qkv_spec,
-                conv_weights_T,
+                weight=conv_weights_T,
                 conv_state=self_kv_cache[0],
-                bias_opt=self.conv1d.bias,
-                query_start_loc_opt=spec_query_start_loc_device,
-                cache_indices_opt=spec_causal_conv1d_meta.cache_indices,
-                initial_state_mode_opt=None,
-                num_accepted_tokens_opt=spec_causal_conv1d_meta.num_accepted_tokens,
-                activation_mode=activation_num,
-                pad_slot_id=PAD_SLOT_ID,
-                run_mode=1,
+                bias=self.conv1d.bias,
+                query_start_loc=spec_query_start_loc_device,
+                conv_state_indices=spec_causal_conv1d_meta.cache_indices[:, 0].contiguous(),
+                num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
+                activation=self.activation,
+                # pad_slot_id=PAD_SLOT_ID,
+                max_query_len=spec_state_indices_tensor.size(-1),
             )
             mixed_qkv_spec = output_spec
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -484,7 +497,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 initial_state_mode_opt = non_spec_causal_conv1d_meta.initial_state_mode
                 if get_pcp_group().world_size > 1:
                     conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
+                    # activation_num = 1 if self.activation else 0
                     non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
                     assert non_spec_query_start_loc is not None
                     non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
@@ -505,71 +518,93 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
                             pcp_rank - 1, ...
                         ].transpose(-1, -2)
-                    mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
-                        mixed_qkv_non_spec_output,
+                    # mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
+                    # print(f"=====================query_start_loc_opt:{query_start_loc_opt.get_device()}=================")
+                    if cache_indices_opt.dim() == 1:
+                        cache_indices=cache_indices_opt.contiguous()
+                    elif cache_indices_opt.dim() == 2:
+                        cache_indices=cache_indices_opt[:, 0].contiguous()
+                    
+                    mixed_qkv_non_spec_output = causal_conv1d_fn(
                         mixed_qkv_non_spec,
                         conv_weights_T,
-                        conv_state=self_kv_cache[0],
-                        bias_opt=self.conv1d.bias,
-                        query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
-                        initial_state_mode_opt=initial_state_mode_opt,
-                        num_accepted_tokens_opt=None,
-                        activation_mode=activation_num,
+                        conv_states=self_kv_cache[0],
+                        bias=self.conv1d.bias,
+                        query_start_loc=query_start_loc_opt,
+                        cache_indices=cache_indices,
+                        has_initial_state=initial_state_mode_opt,
+                        # num_accepted_tokens_opt=None,
+                        activation=self.activation,
                         pad_slot_id=PAD_SLOT_ID,
-                        run_mode=0,
+                        head_num=(self.num_k_heads+self.num_k_heads+self.num_v_heads)//self.tp_size
+                        # run_mode=0,
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
                     if prefill_cache_indices.shape[0] > 0:
                         self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
                             -1, ...
                         ].transpose(-1, -2)
+                    query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
                 else:
                     conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
-                    mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
-                        mixed_qkv_non_spec_output,
+                    # activation_num = 1 if self.activation else 0
+                    # mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
+                    # print(f"=====================query_start_loc_opt:{query_start_loc_opt.get_device()}=================")
+                    
+                    if cache_indices_opt.dim() == 1:
+                        cache_indices=cache_indices_opt.contiguous()
+                    elif cache_indices_opt.dim() == 2:
+                        cache_indices=cache_indices_opt[:, 0].contiguous()
+                    
+                    mixed_qkv_non_spec_output = causal_conv1d_fn(
                         mixed_qkv_non_spec,
                         conv_weights_T,
-                        conv_state=self_kv_cache[0],
-                        bias_opt=self.conv1d.bias,
-                        query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
-                        initial_state_mode_opt=initial_state_mode_opt,
-                        num_accepted_tokens_opt=None,
-                        activation_mode=activation_num,
+                        conv_states=self_kv_cache[0],
+                        bias=self.conv1d.bias,
+                        query_start_loc=query_start_loc_opt,
+                        cache_indices=cache_indices,
+                        has_initial_state=initial_state_mode_opt,
+                        # num_accepted_tokens_opt=None,
+                        activation=self.activation,
                         pad_slot_id=PAD_SLOT_ID,
-                        run_mode=0,
+                        head_num=(self.num_k_heads+self.num_k_heads+self.num_v_heads)//self.tp_size
+                        # run_mode=0,
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
+                    query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)
-            activation_num = 1 if self.activation else 0
+            # activation_num = 1 if self.activation else 0
             non_spec_causal_conv1d_meta = attn_metadata.non_spec_decode_metadata.causal_conv1d
             non_spec_query_start_loc_device = non_spec_causal_conv1d_meta.query_start_loc
-            output_non_spec = torch.empty_like(mixed_qkv_non_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
-                output_non_spec,
+            # output_non_spec = torch.empty_like(mixed_qkv_non_spec)
+            # output_non_spec decode [T, N*D]  prefill [N, T, D]
+            
+            if non_spec_causal_conv1d_meta.cache_indices.dim() == 1:
+                conv_state_indices=non_spec_causal_conv1d_meta.cache_indices.contiguous()
+            elif non_spec_causal_conv1d_meta.cache_indices.dim() == 2:
+                conv_state_indices=non_spec_causal_conv1d_meta.cache_indices[:, 0].contiguous()
+            
+            output_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
-                conv_weights_T,
+                weight=conv_weights_T,
                 conv_state=self_kv_cache[0],
-                bias_opt=self.conv1d.bias,
-                query_start_loc_opt=non_spec_query_start_loc_device,
-                cache_indices_opt=non_spec_causal_conv1d_meta.cache_indices,
-                initial_state_mode_opt=None,
-                num_accepted_tokens_opt=None,
-                activation_mode=activation_num,
-                pad_slot_id=PAD_SLOT_ID,
-                run_mode=1,
+                bias=self.conv1d.bias,
+                # query_start_loc=non_spec_query_start_loc_device,
+                conv_state_indices=conv_state_indices,
+                # initial_state_mode_opt=None,
+                num_accepted_tokens=None,
+                activation=self.activation,
+                # max_query_len=1,
+                # pad_slot_id=PAD_SLOT_ID,
+                # run_mode=1,
             )
             mixed_qkv_non_spec = output_non_spec
+            
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
         split_non_spec = (
