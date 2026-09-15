@@ -207,3 +207,16 @@ else:
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels
+
+
+
+from vllm_ascend.ops.gdn import AscendQwen3_5Model
+from vllm.model_executor.models.qwen3_5 import Qwen3_5Model as _QwenCls
+
+_QwenCls.load_weights = AscendQwen3_5Model.load_weights
+
+from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM as _QwenCausal
+
+_QwenCausal.packed_modules_mapping.pop("in_proj_qkvz", None)
+
+from vllm_ascend.patch.worker import patch_qwen3_5_gdn_split  # noqa: F401
