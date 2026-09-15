@@ -15,9 +15,12 @@
 # limitations under the License.
 #
 
+import os
+
 import torch
 import torch_npu
 from einops import rearrange
+from vllm.logger import init_logger
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
@@ -40,6 +43,21 @@ from vllm_ascend.ops.triton.fla.utils import (
     preamble_fusion_enabled,
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+
+logger = init_logger(__name__)
+
+# Importing fla_npu is what puts the custom operator package on ASCEND_CUSTOM_OPP_PATH
+# (and its libcust_opapi.so on LD_LIBRARY_PATH). CANN reads that path when it loads the
+# kernel registry at device init, so an import that happens later -- inside the function,
+# say -- leaves the kernel unresolvable and every shape fails with aclnnStatus=169112.
+# ascend_config imports this eagerly when gdn_fused_chunk_op="fla_npu" for the same reason;
+# this import is the fallback for direct users of the function below.
+try:
+    import fla_npu  # noqa: F401
+
+    from fla_npu.ops.ascendc import npu_gdn_core_fwd_phase6
+except ImportError:
+    npu_gdn_core_fwd_phase6 = None
 
 
 def _chunk_gated_delta_rule_fused(
@@ -113,6 +131,168 @@ def _chunk_gated_delta_rule_fused(
         g=g,
     )
     return o.unsqueeze(0), final_state
+
+
+def _phase6_host_indices(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+    host_cu_seqlens: tuple[int, ...] | None,
+    host_chunk_indices: tuple[int, ...] | None,
+    host_chunk_size: int | None,
+) -> tuple[list[int], list[int]]:
+    """Host-side cu_seqlens/chunk_indices for the Phase 6 aclIntArray parameters.
+
+    Uses the builder's precomputed copies when they apply, which is what keeps the
+    synchronous ``cu_seqlens.tolist()`` off the per-layer path. Falls back to deriving
+    them here whenever the cache cannot be trusted: a different ``chunk_size`` than the
+    builder assumed, or a caller that passes no metadata at all (the unit tests and any
+    direct user of this function).
+    """
+    if (
+        host_cu_seqlens is not None
+        and host_chunk_indices is not None
+        # The builder precomputes for one chunk_size only; a caller asking for a
+        # different chunking would otherwise get indices for the wrong chunk count.
+        and host_chunk_size == chunk_size
+        # Cheap guard against a stale cache. The kernel validates cu_seqlens[-1] == T
+        # and the canonical order anyway, but catching a length mismatch here keeps the
+        # failure readable instead of surfacing as an aclnn error.
+        and len(host_cu_seqlens) == cu_seqlens.numel()
+    ):
+        return list(host_cu_seqlens), list(host_chunk_indices)
+
+    cu_seqlens_list = [int(x) for x in cu_seqlens.tolist()]
+    chunk_indices_list: list[int] = []
+    # chunk_indices must be canonical sequence-major (seq_idx, local_chunk) pairs,
+    # flattened -- the kernel re-derives and compares them, and raises otherwise.
+    for seq_idx in range(len(cu_seqlens_list) - 1):
+        seq_len = cu_seqlens_list[seq_idx + 1] - cu_seqlens_list[seq_idx]
+        if seq_len <= 0:
+            continue
+        for local_chunk in range((seq_len + chunk_size - 1) // chunk_size):
+            chunk_indices_list.extend((seq_idx, local_chunk))
+    return cu_seqlens_list, chunk_indices_list
+
+
+def _chunk_gated_delta_rule_fla_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    actual_seq_lengths: torch.Tensor | None = None,
+    qk_normalized: bool = False,
+    chunk_size: int = 64,
+    host_cu_seqlens: tuple[int, ...] | None = None,
+    host_chunk_indices: tuple[int, ...] | None = None,
+    host_chunk_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused prefill path using the flash-linear-attention-npu Phase 6 kernel.
+
+    Same contract as :func:`_chunk_gated_delta_rule_fused` so both can sit behind
+    the ``gdn_fused_chunk_op`` switch, but dispatches to
+    ``fla_npu.ops.ascendc.npu_gdn_core_fwd_phase6`` (``aclnnGdnCoreFwdPhase6``,
+    the single-kernel P0a checkpoint) instead of the built-in CANN op.
+
+    Modelled on ``flash_chunk_gated_delta_rule_fwd(use_composite_core=True)`` in
+    the upstream ``examples/flash_gated_delta_rule.py``: the kernel folds
+    chunk-local cumsum of ``g``, KKT, solve_tri, recompute_w_u, fwd_h and fwd_o
+    into one launch, so ``g`` is passed raw. It does NOT apply the q/k L2 norm,
+    which is therefore still done here.
+
+    Layout differences from the CANN op, which is most of what this wrapper does:
+      * Phase 6 wants BNSD (``[B, N, S, D]``), not TND, and keeps the batch dim.
+      * It supports GVA natively (``Nv % Nk == 0``), so q/k must NOT be expanded
+        to ``Nv`` heads the way the earlier phase checkpoints require.
+      * State is ``[N, Nv, Dk, Dv]``, the transpose of ``ssm_state``.
+      * ``cu_seqlens``/``chunk_indices`` are plain int lists, not tensors.
+
+    Args:
+        q, k: ``[1, T, Nk, Dk]``   v: ``[1, T, Nv, Dv]``
+        g, beta: ``[1, T, Nv]``    g is fp32 (<=0), beta is (0, 1).
+        initial_state: ``[N, Nv, Dv, Dk]`` — ``ssm_state`` layout.
+        cu_seqlens: cumulative prefill query start locations ``[N+1]``.
+        scale: query scaling factor (``Dk ** -0.5``).
+        actual_seq_lengths: unused, accepted for signature parity with the CANN path.
+        chunk_size: kernel chunk size, must be 64 or 128.
+
+    Returns:
+        o: ``[1, T, Nv, Dv]`` and final_state: ``[N, Nv, Dv, Dk]``.
+    """
+    if not qk_normalized:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    if npu_gdn_core_fwd_phase6 is None:
+        raise RuntimeError(
+            "gdn_fused_chunk_op='fla_npu' needs the flash-linear-attention-npu package, "
+            "which failed to import. Install it, or use gdn_fused_chunk_op='cann'."
+        )
+
+    num_v_heads, head_v_dim = v.shape[2], v.shape[3]
+    num_k_heads, head_k_dim = k.shape[2], k.shape[3]
+    # Fail loudly instead of letting the aclnn shape check raise a message that
+    # gives no hint about which model config walked into an unsupported kernel.
+    if head_k_dim != 128 or head_v_dim not in (128, 256):
+        raise ValueError(
+            f"gdn_fused_chunk_op='fla_npu' requires head_k_dim=128 and head_v_dim in (128, 256), "
+            f"got head_k_dim={head_k_dim}, head_v_dim={head_v_dim}."
+        )
+    if num_v_heads % num_k_heads != 0:
+        raise ValueError(
+            f"gdn_fused_chunk_op='fla_npu' requires num_v_heads divisible by num_k_heads, "
+            f"got num_v_heads={num_v_heads}, num_k_heads={num_k_heads}."
+        )
+
+    # BSND -> BNSD. Phase 6 consumes q/k at Nk heads and expands to Nv internally.
+    q = q.transpose(1, 2).contiguous()  # [1, Nk, T, Dk]
+    k = k.transpose(1, 2).contiguous()  # [1, Nk, T, Dk]
+    v = v.transpose(1, 2).contiguous()  # [1, Nv, T, Dv]
+    # g/beta are already [B, T, Nv], which is the layout the kernel wants. g stays
+    # fp32 and un-cumsummed; the kernel does the chunk-local cumsum itself.
+    g = g.to(torch.float32).contiguous()
+    beta = beta.to(v.dtype).contiguous()
+
+    # ssm_state is [N, Nv, Dv, Dk] but the kernel state is [N, Nv, Dk, Dv].
+    # fp32 state is not supported, and final_state comes back in the dtype of
+    # initial_state, so cast here and let the caller cast back on write-back.
+    initial_state = initial_state.transpose(-1, -2).to(v.dtype).contiguous()
+
+    # The aclnn entry takes cu_seqlens/chunk_indices as host int arrays. Deriving
+    # them here means calling .tolist() on a device tensor, which is a *synchronous*
+    # D2H: it drains the stream, so the device sits idle while the host finishes the
+    # launch. Profiling a single-request 11k-token prefill measured that bubble at
+    # 614us per GDN layer -- 93ms over 30 layers, 15.6% of the kernel time itself --
+    # of which only 27us was the Python list building. The builder already holds the
+    # same values on the host (it is handed prefill_query_start_loc_cpu), so prefer
+    # its copy and keep the local derivation only as a fallback.
+    cu_seqlens_list, chunk_indices_list = _phase6_host_indices(
+        cu_seqlens, chunk_size, host_cu_seqlens, host_chunk_indices, host_chunk_size
+    )
+
+    # Returns (o, final_state, g_cumsum, A); g_cumsum and A are only needed by the
+    # backward pass, which prefill never runs.
+    o, final_state, _, _ = npu_gdn_core_fwd_phase6(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=chunk_indices_list,
+        scale=scale,
+        return_aux=False,
+    )
+
+    # o comes back shaped like v ([1, Nv, T, Dv]) -> [1, T, Nv, Dv]; final_state
+    # goes back to ssm_state layout.
+    return o.transpose(1, 2).contiguous(), final_state.transpose(-1, -2).contiguous()
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -394,7 +574,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         num_decode_tokens = attn_metadata.num_decode_tokens
 
-        # Select the fused CANN operator via env var. The fused op only supports the
+        # Select a fused operator via env var, then pick which one with
+        # gdn_fused_chunk_op ("cann" or "fla_npu"). Both fused ops only support the
         # non-PCP case; keep the Triton pipeline as default.
         use_fused_chunk = get_ascend_config().enable_gdn_fused_chunk and get_pcp_group().world_size == 1
         # The whole preamble - gating, the ssm gather, the clear, the bf16 cast and
@@ -550,7 +731,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # Advanced indexing already returns a copy, safe to clear in place.
                     initial_state = ssm_state[prefill_state_indices]
                     clear_ssm_states(initial_state, prefill_has_initial_state)
-                (core_attn_out_non_spec, last_recurrent_state) = _chunk_gated_delta_rule_fused(
+                use_fla_npu = get_ascend_config().gdn_fused_chunk_op == "fla_npu"
+                fused_chunk_fn = (
+                    _chunk_gated_delta_rule_fla_npu if use_fla_npu else _chunk_gated_delta_rule_fused
+                )
+                chunk_meta = attn_metadata.non_spec_prefill_metadata.chunk
+                # Only the Phase 6 path needs the host-side copies, and only it accepts
+                # these kwargs; the CANN op keeps cu_seqlens on the device.
+                host_kwargs = (
+                    {
+                        "host_cu_seqlens": chunk_meta.cu_seqlens_host,
+                        "host_chunk_indices": chunk_meta.phase6_chunk_indices_host,
+                        "host_chunk_size": chunk_meta.phase6_chunk_size,
+                    }
+                    if use_fla_npu
+                    else {}
+                )
+                (core_attn_out_non_spec, last_recurrent_state) = fused_chunk_fn(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
@@ -559,8 +756,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     initial_state=initial_state,
                     cu_seqlens=prefill_query_start_loc,
                     scale=key_non_spec.shape[-1] ** -0.5,
-                    actual_seq_lengths=attn_metadata.non_spec_prefill_metadata.chunk.actual_seq_lengths,
+                    actual_seq_lengths=chunk_meta.actual_seq_lengths,
                     qk_normalized=fuse_preamble,
+                    **host_kwargs,
                 )
                 # Kept on the aclnn path on purpose: measured on this stack a Triton
                 # launch costs ~350us of host time per call while Cast + aclnnIndexPut

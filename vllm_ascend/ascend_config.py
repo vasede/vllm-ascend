@@ -163,6 +163,30 @@ class AscendConfig:
         # Whether to use the fused torch_npu.npu_chunk_gated_delta_rule op in the
         # GDN prefill stage instead of the default Triton chunk_gated_delta_rule pipeline.
         self.enable_gdn_fused_chunk = additional_config.get("enable_gdn_fused_chunk", False)
+        # Which fused operator to use for the GDN prefill stage when
+        # enable_gdn_fused_chunk is on:
+        #   "cann"    - torch_npu.npu_chunk_gated_delta_rule (default, built-in CANN op)
+        #   "fla_npu" - flash-linear-attention-npu Phase6 single-kernel
+        #               (fla_npu.ops.ascendc.npu_gdn_core_fwd_phase6, l0op::ChunkGdnCoreFwd)
+        self.gdn_fused_chunk_op = additional_config.get("gdn_fused_chunk_op", "cann")
+        if self.gdn_fused_chunk_op not in ("cann", "fla_npu"):
+            raise ValueError(
+                f"gdn_fused_chunk_op must be 'cann' or 'fla_npu', got {self.gdn_fused_chunk_op!r}"
+            )
+        if self.gdn_fused_chunk_op == "fla_npu":
+            # Import here, not at first use: importing fla_npu is what prepends its custom
+            # operator package to ASCEND_CUSTOM_OPP_PATH, and CANN only reads that path when
+            # it loads the kernel registry at device init. init_ascend_config runs in
+            # check_and_update_config, before the workers touch the device, so this is the
+            # earliest hook that knows the option is on. Importing after device init leaves
+            # every shape failing with aclnnStatus=169112.
+            try:
+                import fla_npu  # noqa: F401
+            except ImportError as exc:
+                raise ValueError(
+                    "gdn_fused_chunk_op='fla_npu' requires the flash-linear-attention-npu "
+                    f"package, which could not be imported: {exc}"
+                ) from exc
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))

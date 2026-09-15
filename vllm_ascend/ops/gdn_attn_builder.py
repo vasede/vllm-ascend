@@ -69,7 +69,17 @@ class GDNChunkedPrefillMetadata:
     # step here instead of once per GDN layer: it only depends on cu_seqlens, so
     # deriving it in the layer costs one redundant launch per layer.
     actual_seq_lengths: torch.Tensor | None = None
-
+    # chunk_indices for the fla_npu Phase 6 kernel, which takes it as a host
+    # aclIntArray. Built here so the layer never has to call cu_seqlens.tolist():
+    # that is a *synchronous* D2H which drains the stream, and profiling measured
+    # the resulting device bubble at 614us per GDN layer (93ms over 30 layers of a
+    # single 11k-token prefill) with only 27us of it being the actual Python work.
+    # NOTE: deliberately NOT reusing chunk_indices_chunk64_host -- prepare_chunk_indices
+    # numbers sequences by counting non-empty ones, while the Phase 6 wrapper validates
+    # against enumerate() over cu_seqlens, so the two disagree as soon as a segment is
+    # empty (cu=[0,5,5,12] gives [0,0,1,0] vs [0,0,2,0]) and the kernel would raise.
+    phase6_chunk_size: int | None = None
+    phase6_chunk_indices_host: tuple[int, ...] | None = None
 
 @dataclass
 class GDNCausalConv1dMetadata:
@@ -185,6 +195,18 @@ def _build_non_spec_chunked_prefill_metadata(
         cu_seqlens_kern = None
     else:
         cu_seqlens_kern = tuple(cu_seqlens_kern)
+    
+    # Same loop the Phase 6 layer used to run per layer, kept byte-identical so the
+    # kernel's canonical-order check still passes: skip empty segments, but keep the
+    # true sequence index for the ones that remain.
+    phase6_chunk_indices_host: list[int] = []
+    for seq_idx in range(len(cu_seqlens_host) - 1):
+        seq_len = cu_seqlens_host[seq_idx + 1] - cu_seqlens_host[seq_idx]
+        if seq_len <= 0:
+            continue
+        for local_chunk in range((seq_len + _GDN_CHUNK_SIZE - 1) // _GDN_CHUNK_SIZE):
+            phase6_chunk_indices_host.extend((seq_idx, local_chunk))
+
 
     return GDNChunkedPrefillMetadata(
         cu_seqlens_host=cu_seqlens_host,
@@ -199,6 +221,8 @@ def _build_non_spec_chunked_prefill_metadata(
         cu_seqlens_kern=cu_seqlens_kern,
         keep_meta=keep_meta,
         actual_seq_lengths=actual_seq_lengths,
+        phase6_chunk_size=_GDN_CHUNK_SIZE,
+        phase6_chunk_indices_host=tuple(phase6_chunk_indices_host),
     )
 
 
