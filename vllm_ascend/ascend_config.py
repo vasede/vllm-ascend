@@ -166,8 +166,9 @@ class AscendConfig:
         # Which fused operator to use for the GDN prefill stage when
         # enable_gdn_fused_chunk is on:
         #   "cann"    - torch_npu.npu_chunk_gated_delta_rule (default, built-in CANN op)
-        #   "fla_npu" - flash-linear-attention-npu Phase6 single-kernel
-        #               (fla_npu.ops.ascendc.npu_gdn_core_fwd_phase6, l0op::ChunkGdnCoreFwd)
+        #   "fla_npu" - flash-linear-attention-npu fused single-kernel
+        #               (fla_npu.ops.ascendc.npu_chunk_gated_delta_rule_fwd,
+        #                aclnnChunkGatedDeltaRuleFwd)
         self.gdn_fused_chunk_op = additional_config.get("gdn_fused_chunk_op", "cann")
         if self.gdn_fused_chunk_op not in ("cann", "fla_npu"):
             raise ValueError(

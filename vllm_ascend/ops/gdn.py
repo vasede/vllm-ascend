@@ -54,10 +54,10 @@ logger = init_logger(__name__)
 # this import is the fallback for direct users of the function below.
 try:
     import fla_npu  # noqa: F401
-
-    from fla_npu.ops.ascendc import npu_gdn_core_fwd_phase6
+    
+    from fla_npu.ops.ascendc import npu_chunk_gated_delta_rule_fwd
 except ImportError:
-    npu_gdn_core_fwd_phase6 = None
+    npu_chunk_gated_delta_rule_fwd = None
 
 
 def _chunk_gated_delta_rule_fused(
@@ -133,7 +133,7 @@ def _chunk_gated_delta_rule_fused(
     return o.unsqueeze(0), final_state
 
 
-def _phase6_host_indices(
+def _resolve_host_cu_seqlens_and_chunk_indices(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
     host_cu_seqlens: tuple[int, ...] | None,
@@ -194,8 +194,9 @@ def _chunk_gated_delta_rule_fla_npu(
 
     Same contract as :func:`_chunk_gated_delta_rule_fused` so both can sit behind
     the ``gdn_fused_chunk_op`` switch, but dispatches to
-    ``fla_npu.ops.ascendc.npu_gdn_core_fwd_phase6`` (``aclnnGdnCoreFwdPhase6``,
-    the single-kernel P0a checkpoint) instead of the built-in CANN op.
+    ``fla_npu.ops.ascendc.npu_chunk_gated_delta_rule_fwd``
+    (``aclnnChunkGatedDeltaRuleFwd``, the single-kernel fused entry) instead of the
+    built-in CANN op.
 
     Modelled on ``flash_chunk_gated_delta_rule_fwd(use_composite_core=True)`` in
     the upstream ``examples/flash_gated_delta_rule.py``: the kernel folds
@@ -222,11 +223,11 @@ def _chunk_gated_delta_rule_fla_npu(
     Returns:
         o: ``[1, T, Nv, Dv]`` and final_state: ``[N, Nv, Dv, Dk]``.
     """
-    if not qk_normalized:
-        q = l2norm_fwd(q)
-        k = l2norm_fwd(k)
+    # if not qk_normalized:
+    #     q = l2norm_fwd(q)
+    #     k = l2norm_fwd(k)
 
-    if npu_gdn_core_fwd_phase6 is None:
+    if npu_chunk_gated_delta_rule_fwd is None: 
         raise RuntimeError(
             "gdn_fused_chunk_op='fla_npu' needs the flash-linear-attention-npu package, "
             "which failed to import. Install it, or use gdn_fused_chunk_op='cann'."
@@ -259,7 +260,7 @@ def _chunk_gated_delta_rule_fla_npu(
     # ssm_state is [N, Nv, Dv, Dk] but the kernel state is [N, Nv, Dk, Dv].
     # fp32 state is not supported, and final_state comes back in the dtype of
     # initial_state, so cast here and let the caller cast back on write-back.
-    initial_state = initial_state.transpose(-1, -2).to(v.dtype).contiguous()
+    # initial_state = initial_state.transpose(-1, -2).to(v.dtype).contiguous()
 
     # The aclnn entry takes cu_seqlens/chunk_indices as host int arrays. Deriving
     # them here means calling .tolist() on a device tensor, which is a *synchronous*
@@ -269,31 +270,33 @@ def _chunk_gated_delta_rule_fla_npu(
     # of which only 27us was the Python list building. The builder already holds the
     # same values on the host (it is handed prefill_query_start_loc_cpu), so prefer
     # its copy and keep the local derivation only as a fallback.
-    cu_seqlens_list, chunk_indices_list = _phase6_host_indices(
+    cu_seqlens_list, chunk_indices_list = _resolve_host_cu_seqlens_and_chunk_indices(
         cu_seqlens, chunk_size, host_cu_seqlens, host_chunk_indices, host_chunk_size
     )
 
-    # Returns (o, final_state, g_cumsum, A); g_cumsum and A are only needed by the
-    # backward pass, which prefill never runs.
-    o, final_state, _, _ = npu_gdn_core_fwd_phase6(
+    # backward pass, which prefill never runs, but they cannot be skipped: passing
+    # disable_recompute=True drops them from the output tuple and the aclnn entry then
+    # rejects the call with aclnnStatus=169104, so keep the default and discard them.
+    o, final_state = npu_chunk_gated_delta_rule_fwd(
         q,
         k,
         v,
         g,
         beta,
         initial_state=initial_state,
+        use_exp2=True,
+        use_qk_l2norm_in_kernel=True,
+        disable_recompute=True,
+        state_v_first=True,
         output_final_state=True,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=chunk_indices_list,
         scale=scale,
-        return_aux=False,
+        layout="BNSD",
     )
 
-    # o comes back shaped like v ([1, Nv, T, Dv]) -> [1, T, Nv, Dv]; final_state
-    # goes back to ssm_state layout.
-    return o.transpose(1, 2).contiguous(), final_state.transpose(-1, -2).contiguous()
-
+    return o, final_state
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -597,6 +600,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         fused_prefill_qk = None
         fused_decode_qk = None
         fused_initial_state = None
+        fuse_preamble = False
         if fuse_preamble:
             # q/k cover the WHOLE batch: l2norm is a per-token row reduction over the
             # feature dim, so normalizing all rows and slicing is bit-identical to
