@@ -605,14 +605,19 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         world_size = self.layer.tp_size
         soc_version = get_ascend_device_type()
+        # Respect the A5 fusion switch for BF16 and W8A8 as well as MXFP8.
+        # Otherwise the disabled path still calls the fused op with unsupported AIV.
+        if soc_version == AscendDeviceType.A5:
+            mmrs_fusion = mmrs_fusion and matmul_reduce_scatter_enable()
         # MC2 Matmul+ReduceScatter fusion on A5 (feature gate:
         # enable_matmul_reduce_scatter). A5 quant RS requires comm_mode
         # ccu/ai_cpu (None -> EZ0024) and the AICPU comm channel provisioned by
         # the ccu_sched group (built with hccl_op_expansion_mode=6); the plain
         # TP group fails channel init (RunAicpuIndOpChannelInitV2) in profile_run.
-        a5_rs_fusion = (
-            mmrs_fusion and soc_version == AscendDeviceType.A5 and matmul_reduce_scatter_enable()
-        )
+        # a5_rs_fusion = (
+        #     mmrs_fusion and soc_version == AscendDeviceType.A5 and matmul_reduce_scatter_enable()
+        # )
+        a5_rs_fusion = mmrs_fusion and soc_version == AscendDeviceType.A5
         if a5_rs_fusion:
             comm_mode = "ai_cpu"
             hcom_name = (

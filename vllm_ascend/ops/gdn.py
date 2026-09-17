@@ -349,6 +349,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            # FlashComm1 gathers the sequence before the input projection.
+            num_tokens = mixed_qkv.size(0)
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
