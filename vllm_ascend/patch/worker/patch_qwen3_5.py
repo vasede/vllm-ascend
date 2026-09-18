@@ -31,6 +31,7 @@ except ImportError:
     IntermediateTensors = None
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p
@@ -209,14 +210,20 @@ else:
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels
 
 
+    # Splitting the fused `in_proj_qkvz` into `in_proj_qkv` + `in_proj_z` is
+    # opt-in via VLLM_ASCEND_ENABLE_GDN_QKV_SPLIT=1. By default the upstream fused
+    # layout, its weight loading and its packed module mapping are all left
+    # untouched. `AscendGatedDeltaNetAttention.forward` picks the matching branch
+    # by probing for the `in_proj_qkv` attribute.
+    if envs_ascend.VLLM_ASCEND_ENABLE_GDN_QKV_SPLIT:
+        from vllm_ascend.ops.gdn import AscendQwen3_5Model
+        from vllm.model_executor.models.qwen3_5 import Qwen3_5Model as _QwenCls
 
-from vllm_ascend.ops.gdn import AscendQwen3_5Model
-from vllm.model_executor.models.qwen3_5 import Qwen3_5Model as _QwenCls
+        _QwenCls.load_weights = AscendQwen3_5Model.load_weights
 
-_QwenCls.load_weights = AscendQwen3_5Model.load_weights
+        from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM as _QwenCausal
 
-from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM as _QwenCausal
+        _QwenCausal.packed_modules_mapping.pop("in_proj_qkvz", None)
 
-_QwenCausal.packed_modules_mapping.pop("in_proj_qkvz", None)
+        from vllm_ascend.patch.worker import patch_qwen3_5_gdn_split  # noqa: F401
 
-from vllm_ascend.patch.worker import patch_qwen3_5_gdn_split  # noqa: F401

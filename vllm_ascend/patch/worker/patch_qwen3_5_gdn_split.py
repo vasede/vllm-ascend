@@ -2,6 +2,9 @@
 #
 # 功能：通过 monkey-patch 将 Qwen3.5 GDN 层的 in_proj_qkvz 拆分为独立模块，
 #       并同步修正 weight loading 映射，与直接修改 vLLM 源码完全等价。
+#
+# 开关：环境变量 VLLM_ASCEND_ENABLE_GDN_QKV_SPLIT，默认 0（不启用），此时本模块
+#       不做任何 patch，保持上游融合的 in_proj_qkvz 布局。置 1 才启用拆分。
 
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -11,8 +14,10 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention as _GDNBaseCls,
 )
 
+import vllm_ascend.envs as envs_ascend
 
 _original_gdn_init = _GDNBaseCls.__init__
+
 
 
 def _patched_gdn_init(self, *args, **kwargs):
@@ -67,5 +72,6 @@ def _patched_gdn_init(self, *args, **kwargs):
     )
 
 
-_GDNBaseCls.__init__ = _patched_gdn_init
+if envs_ascend.VLLM_ASCEND_ENABLE_GDN_QKV_SPLIT:
+    _GDNBaseCls.__init__ = _patched_gdn_init
 
