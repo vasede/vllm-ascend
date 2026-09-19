@@ -15,6 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import os
 from typing import Any
 
 import torch
@@ -157,7 +158,20 @@ class BaseDeviceAdaptor:
             bias_opt=bias_opt,
         )
         return topk_weights, topk_ids.to(torch.int32), out
-
+    
+    @staticmethod
+    def npu_mm_all_reduce_base(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        hcom: str,
+        *,
+        bias: torch.Tensor | None = None,
+        comm_mode: str | None = None,
+    ) -> torch.Tensor:
+        if comm_mode is not None:
+            return torch_npu.npu_mm_all_reduce_base(x1, x2, hcom, bias=bias, comm_mode=comm_mode)
+        return torch_npu.npu_mm_all_reduce_base(x1, x2, hcom, bias=bias)
+    
     @staticmethod
     def npu_dynamic_quant(
         hidden_states: torch.Tensor,
@@ -1234,6 +1248,25 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         return topk_weights, topk_ids.to(torch.int32), out
+
+    @staticmethod
+    def npu_mm_all_reduce_base(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        hcom: str,
+        *,
+        bias: torch.Tensor | None = None,
+        comm_mode: str | None = None,
+    ) -> torch.Tensor:
+        # MC2 must use the same communication mode as the shared TP domain.
+        # With CCU_SCHED, leaving comm_mode unset can initialize AICPU state
+        # that breaks subsequent ordinary AllReduce on this communicator.
+        if comm_mode is not None:
+            return BaseDeviceAdaptor.npu_mm_all_reduce_base(x1, x2, hcom, bias=bias, comm_mode=comm_mode)
+        if os.environ.get("HCCL_OP_EXPANSION_MODE") == "CCU_SCHED":
+            return torch_npu.npu_mm_all_reduce_base(x1, x2, hcom, bias=bias, comm_mode="ccu")
+        return BaseDeviceAdaptor.npu_mm_all_reduce_base(x1, x2, hcom, bias=bias)
+
 
     @staticmethod
     def npu_dynamic_quant(

@@ -34,6 +34,9 @@ _DYNAMIC_EPLB: GroupCoordinator | None = None
 # A5 MatmulReduceScatter CCU-offload scheduling group
 _CCU_SCHED: GroupCoordinator | None = None
 
+# Dedicated TP domain for A5 prefill MatmulAllReduce (AICPU).
+_MATMUL_ALLREDUCE: GroupCoordinator | None = None
+
 
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
@@ -120,6 +123,27 @@ def init_ascend_model_parallel(
         ccu_sched_group_ranks = [x.tolist() for x in all_ranks.view(-1, global_tp_size)]
         _CCU_SCHED = init_model_parallel_group(
             ccu_sched_group_ranks, get_world_group().local_rank, backend, group_name="ccu_sched"
+        )
+
+    if (
+        get_ascend_device_type() == AscendDeviceType.A5
+        and global_tp_size > 1
+        and get_ascend_config().enable_matmul_allreduce
+    ):
+        global _MATMUL_ALLREDUCE
+        # Initialize ordinary HCCL resources before AICPU MC2. Even separate
+        # domains can fail with 507018 if MC2 initializes process resources first.
+        warmup = torch.zeros(1, device=get_tp_group().device)
+        torch.distributed.all_reduce(warmup, group=get_tp_group().device_group)
+        torch.npu.synchronize()
+        # The mc2 name preserves HCCL_BUFFSIZE instead of applying the small
+        # ordinary-collective buffer override. Never share this domain with
+        # decode AllReduce: AICPU MC2 initialization affects communicator state.
+        _MATMUL_ALLREDUCE = init_model_parallel_group(
+            [x.tolist() for x in all_ranks.view(-1, global_tp_size)],
+            get_world_group().local_rank,
+            backend,
+            group_name="matmul_allreduce_mc2",
         )
 
     # Initialize fine-grained TP process groups on Ascend for four components:
@@ -304,7 +328,17 @@ def get_ccu_sched_group() -> GroupCoordinator:
     return _CCU_SCHED
 
 
+def get_matmul_allreduce_group() -> GroupCoordinator:
+    assert _MATMUL_ALLREDUCE is not None, "MatmulAllReduce group is not initialized"
+    return _MATMUL_ALLREDUCE
+
+
 def destroy_ascend_model_parallel():
+    global _MATMUL_ALLREDUCE
+    if _MATMUL_ALLREDUCE is not None:
+        _MATMUL_ALLREDUCE.destroy()
+    _MATMUL_ALLREDUCE = None
+
     global _MC2
     if _MC2:
         _MC2.destroy()

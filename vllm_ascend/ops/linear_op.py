@@ -62,10 +62,12 @@ from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import (
     get_ccu_sched_group,
     get_flashcomm2_odp_group,
     get_flashcomm2_otp_group,
+    get_matmul_allreduce_group,
     get_mlp_tp_group,
     get_otp_group,
 )
@@ -422,41 +424,77 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
 
 
 class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
-    _HCOMM_INFO = None
-
     def __init__(self, layer):
         super().__init__(layer)
-        self.hcomm_info = self.get_hcomm_info(self.comm_group.device_group)
+        self.matmul_comm_mode = None
+        group = self.comm_group
+        if get_ascend_device_type() == AscendDeviceType.A5 and self.tp_size > 1:
+            group = get_matmul_allreduce_group()
+            assert group.ranks == self.comm_group.ranks, "MC2 and TP rank ordering must match"
+            self.matmul_comm_mode = "ai_cpu"
+        self.hcomm_info = self.get_hcomm_info(group.device_group)
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         input_parallel = self.get_input_parallel(input_)
         """Calculate the output tensor of forward by considering
         fusing communication and computation."""
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        if self.reduce_results and self.tp_size > 1:
-            output = torch_npu.npu_mm_all_reduce_base(
-                input_parallel, self.layer.weight.t(), self.hcomm_info, bias=bias_
-            )
-        else:
-            assert self.quant_method is not None
-            output = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-
+        # Dispatch through the custom op so the row-count decision in
+        # matmul_and_reduce() below stays opaque to torch.compile. Calling
+        # npu_mm_all_reduce_base() inline instead bakes whichever branch trace time
+        # happened to take -- profile_run traces at max_num_batched_tokens, so decode
+        # would replay a captured graph containing the fused op regardless of its own
+        # row count, and the op's internal rtMemcpy aborts a capturing stream.
+        output = torch.ops.vllm.matmul_and_reduce(input_parallel, self.unique_prefix)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    @classmethod
-    def get_hcomm_info(cls, group: ProcessGroup) -> str:
-        """Get the HCCL communication information for the given group."""
-        if cls._HCOMM_INFO is not None:
-            return cls._HCOMM_INFO
+    def matmul_and_reduce(self, input_parallel: torch.Tensor, bias_: Parameter | None) -> torch.Tensor:
+        """Fuse matmul with its AllReduce once M is large enough to be worth it.
 
+        aclnnMatmulAllReduce pipelines communication against compute along M, so it
+        needs enough rows to tile. Measured on A5, tp2, bf16, [*,3072]x[3072,5120]:
+        0.32x at M=4, 0.35x at 8, 0.66x at 64, 0.92x at 256, 1.18x at 512, 1.35x at
+        1024, 1.47x at 1536, 1.20-1.29x from 2048 up to 16384. Fusing unconditionally
+        therefore cost ~3x on decode-sized batches, so reuse the same 512 threshold the
+        AddRMSNorm fusion pass uses. Staying unfused below it also keeps the fused op
+        out of decode aclgraph capture, which would otherwise abort on its rtMemcpy
+        (acl_graph.py captures with capture_error_mode="global").
+
+        Needs HCCL_BUFFSIZE >= 2048: the 200MB default aborts with 50701 past M~1536.
+        """
+        from vllm_ascend.compilation.passes.allreduce_rmsnorm_fusion_pass import (
+            ALLREDUCE_NORM_FUSE_THRESHOLD,
+        )
+
+        if self.reduce_results and self.tp_size > 1 and input_parallel.shape[0] >= ALLREDUCE_NORM_FUSE_THRESHOLD:
+            return DeviceOperator.npu_mm_all_reduce_base(
+                input_parallel,
+                self.layer.weight.t(),
+                self.hcomm_info,
+                bias=bias_,
+                comm_mode=self.matmul_comm_mode,
+            )
+
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
+
+    def update_attrs(self):
+        # torch.ops.vllm.matmul_and_reduce resolves the layer by this prefix.
+        super().update_attrs()
+        self.unique_prefix = self.layer.unique_prefix
+
+    @staticmethod
+    def get_hcomm_info(group: ProcessGroup) -> str:
+        # A class-wide cache can return a handle from a different domain or
+        # a destroyed process group. The backend already caches its handle.
         rank = torch.distributed.get_rank(group)
         if torch.__version__ > "2.0":
             global_rank = torch.distributed.get_global_rank(group, rank)
-            cls._HCOMM_INFO = group._get_backend(torch.device("npu")).get_hccl_comm_name(global_rank)
-        else:
-            cls._HCOMM_INFO = group.get_hccl_comm_name(rank)
-        return cls._HCOMM_INFO
+            return group._get_backend(torch.device("npu")).get_hccl_comm_name(global_rank)
+        return group.get_hccl_comm_name(rank)
 
 
 class SequenceColumnParallelOp(CustomColumnParallelOp):

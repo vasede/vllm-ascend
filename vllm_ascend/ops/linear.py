@@ -46,6 +46,7 @@ from vllm_ascend.utils import (
     enable_sp,
     get_ascend_device_type,
     is_310p,
+    matmul_allreduce_enable,
     maybe_trans_nz,
 )
 
@@ -295,7 +296,9 @@ class AscendRowParallelLinear(RowParallelLinear):
         disable_tp: bool = False,
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
-        if enable_sp():
+        # matmul_allreduce needs this too: MatmulAllreduceRowParallelOp dispatches through
+        # torch.ops.vllm.matmul_and_reduce, which resolves the layer by unique_prefix.
+        if enable_sp() or matmul_allreduce_enable():
             compilation_config = get_current_vllm_config().compilation_config
             unique_prefix = prefix
             if prefix in compilation_config.static_forward_context:

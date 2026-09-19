@@ -1118,6 +1118,9 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     # FIXME: Current mc2 operators only perform communication space partitioning
     # based on HCCL_BUFFSIZE configuration. Using pg_options with mc2 group would
     # result in memory misalignment problems.
+    if group_name == "matmul_allreduce_mc2":
+        # Select AICPU without overriding the MC2 buffer size from HCCL_BUFFSIZE.
+        return {"hccl_op_expansion_mode": 2}
     if group_name and "mc2" in group_name:
         return None
     hccl_config_map = {
