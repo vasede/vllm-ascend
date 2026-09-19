@@ -81,6 +81,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     get_flashcomm2_reorgnized_batch_ids,
     get_weight_prefetch_method,
+    is_vision_tower_prefix,
     is_vl_model,
     matmul_allreduce_enable,
     matmul_all_gather_enable,
@@ -877,7 +878,11 @@ def _get_row_parallel_op(
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
-    if matmul_allreduce_enable():
+    # Keep the vision tower off this op: it dispatches through
+    # torch.ops.vllm.matmul_and_reduce, which needs a forward context the mm
+    # encoder never runs inside. The fusion targets LLM shapes anyway -- its
+    # 512-row profitability threshold was measured on LLM projections.
+    if matmul_allreduce_enable() and not is_vision_tower_prefix(prefix):
         return MatmulAllreduceRowParallelOp(layer)
     if flashcomm2_enable():
         if "o_proj" in prefix or "out_proj" in prefix:

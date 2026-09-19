@@ -897,6 +897,25 @@ def matmul_allreduce_enable() -> bool:
     return get_ascend_config().enable_matmul_allreduce
 
 
+# Prefixes under which every VL model in vllm builds its vision tower:
+# "visual" (Qwen2/3-VL, GLM-4.1V, Keye, ...), "vision_model", "vision_tower"
+# and the bare "vision". The last three all contain "vision", so two
+# substrings are enough to cover them.
+_VISION_TOWER_PREFIXES = ("visual", "vision")
+
+
+def is_vision_tower_prefix(prefix: str) -> bool:
+    """Whether a layer prefix belongs to the vision tower rather than the LLM.
+
+    The multimodal encoder runs outside `set_forward_context`: both
+    `_execute_mm_encoder` callers and `profile_run`'s `embed_multimodal` run
+    before the model runner enters the forward context. Ops that dispatch
+    through `torch.ops.vllm.*` resolve their layer from that context, so they
+    must not be installed on vision tower layers.
+    """
+    return any(p in prefix for p in _VISION_TOWER_PREFIXES)
+
+
 def matmul_reduce_scatter_enable() -> bool:
     return get_ascend_config().enable_matmul_reduce_scatter
 
