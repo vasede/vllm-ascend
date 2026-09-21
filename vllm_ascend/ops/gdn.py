@@ -307,6 +307,29 @@ def _chunk_gated_delta_rule_fla_npu(
 
     return o, final_state
 
+
+def _rearrange_decode_qkv(
+    mixed_qkv: torch.Tensor,
+    key_dim: int,
+    value_dim: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return contiguous decode Q/K/V without concatenating them again.
+
+    The recurrent kernel and l2norm consume contiguous token-major tensors.
+    Each component is copied separately only when its split view has gaps
+    between tokens. A single-token input needs no data copy.
+    """
+    num_tokens = mixed_qkv.shape[0]
+    query, key, value = torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)
+    return (
+        query.contiguous().view(1, num_tokens, -1, head_k_dim),
+        key.contiguous().view(1, num_tokens, -1, head_k_dim),
+        value.contiguous().view(1, num_tokens, -1, head_v_dim),
+    )
+
+
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
@@ -588,7 +611,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                             num_accepted_tokens=None,
                             activation=self.activation,
                         )
-                        decode_conv_qkv = self.rearrange_mixed_qkv(decode_conv_out)
+                        decode_conv_qkv = _rearrange_decode_qkv(
+                            decode_conv_out,
+                            self.key_dim // self.tp_size,
+                            self.value_dim // self.tp_size,
+                            self.head_k_dim,
+                            self.head_v_dim,
+                        )
                         # Prefill-only view. prefill_query_start_loc is already rebased
                         # to 0 by the builder; the per-row metadata is sliced past the
                         # decode rows exactly like prefill_has_initial_state is.
@@ -650,7 +679,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             mixed_qkv_non_spec = output_non_spec
             
-            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+            query_non_spec, key_non_spec, value_non_spec = _rearrange_decode_qkv(
+                mixed_qkv_non_spec,
+                self.key_dim // self.tp_size,
+                self.value_dim // self.tp_size,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
         else:
             mixed_qkv_non_spec = None
 
