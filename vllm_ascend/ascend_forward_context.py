@@ -17,6 +17,7 @@ from vllm_ascend.utils import (
     enable_sp,
     flashcomm2_enable,
     get_ascend_device_type,
+    get_inner_model,
     has_layer_idx,
     is_drafter_moe_model,
     is_moe_model,
@@ -156,7 +157,7 @@ def set_ascend_forward_context(
         # This is only applicable to models that contain these necessary attributes.
         forward_context.layer_idx = None
         if has_layer_idx(model_instance):
-            forward_context.layer_idx = model_instance.model.start_layer
+            forward_context.layer_idx = get_inner_model(model_instance).start_layer
 
         forward_context.prefetch_mlp_gate_up_proj = False
         forward_context.prefetch_mlp_down_proj = False

@@ -44,6 +44,7 @@ from vllm_ascend.ops.triton.fla.utils import (
     preamble_fusion_enabled,
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+from vllm_ascend.utils import get_weight_prefetch_method
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 
 logger = init_logger(__name__)
@@ -444,7 +445,28 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
+        # The core op starts out_proj prefetch. This norm joins the prefetch
+        # stream after its computation, immediately before the weight reader.
+        prefetch_method = get_weight_prefetch_method()
+        out_proj_ratio = (
+            float(prefetch_method.attn.prefetch_ratio.get("o", 0))
+            if prefetch_method is not None and prefetch_method.attn.enable
+            else 0.0
+        )
+        if out_proj_ratio > 0:
+            core_attn_out = torch.ops.vllm.prefetch_gated_norm(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.out_proj.weight,
+                self.norm.eps,
+                -1 if self.norm.group_size is None else self.norm.group_size,
+                self.norm.norm_before_gate,
+                out_proj_ratio,
+                num_tokens,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
@@ -459,6 +481,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         Core attention computation (called by custom op).
         """
+        # Launch inside the existing mutating core custom op so compilation
+        # cannot discard or move this fork past the core computation.
+        from vllm_ascend.ops.mlp_weight_prefetch import _start_prefetch
+
+        method = get_weight_prefetch_method()
+        ratio = float(method.attn.prefetch_ratio.get("o", 0)) if method is not None and method.attn.enable else 0.0
+        if ratio > 0:
+            _start_prefetch(self.out_proj.weight, mixed_qkv, ratio, num_tokens=mixed_qkv.shape[0])
+
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 

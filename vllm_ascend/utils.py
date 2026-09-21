@@ -1307,13 +1307,35 @@ def should_skip_allreduce_across_dp_group(vllm_config, is_draft_model: bool = Fa
     return decode_must_use_mc2 and (prefill_must_use_mc2 or get_ascend_config().recompute_scheduler_enable)
 
 
+def get_inner_model(model_instance: torch.nn.Module) -> torch.nn.Module | None:
+    """Return the module that owns ``.layers`` / ``.start_layer``.
+
+    Text-only models expose it as ``model_instance.model``. Multimodal wrappers
+    (``*ForConditionalGeneration``) nest it one level deeper under
+    ``language_model``, same as xlite already handles.
+    """
+    if model_instance is None:
+        return None
+
+    inner = getattr(model_instance, "model", None)
+    if inner is not None and hasattr(inner, "start_layer"):
+        return inner
+
+    lang = getattr(model_instance, "language_model", None)
+    if lang is not None:
+        inner = getattr(lang, "model", None)
+        if inner is not None and hasattr(inner, "start_layer"):
+            return inner
+    return None
+
+
 def has_layer_idx(model_instance: torch.nn.Module) -> bool:
     if model_instance is None:
         return False
 
     global _HAS_LAYER_IDX
     if _HAS_LAYER_IDX is None:
-        _HAS_LAYER_IDX = hasattr(model_instance, "model") and hasattr(model_instance.model, "start_layer")
+        _HAS_LAYER_IDX = get_inner_model(model_instance) is not None
     return _HAS_LAYER_IDX
 
 

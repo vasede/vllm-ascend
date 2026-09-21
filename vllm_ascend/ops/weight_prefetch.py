@@ -8,11 +8,32 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm_ascend.ascend_config import WeightPrefetchConfig
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.linear import AscendQKVParallelLinear, AscendRowParallelLinear
-from vllm_ascend.utils import is_moe_model
+from vllm_ascend.utils import get_inner_model, is_moe_model
 
 SUPPORTED_MODULES = ["attn", "mlp", "moe"]
 MOE_PREFETCH_TOKEN_THRESHOLD = 96
 MAX_PREFETCH_WEIGHT_SIZE = 18 * 1024 * 1024
+
+
+def layers_of_model_instance(model_instance) -> list | None:
+    """Decoder layer list, for text-only and multimodal-wrapped models alike."""
+    inner = get_inner_model(model_instance)
+    return getattr(inner, "layers", None) if inner is not None else None
+
+
+def layer_idx_from_prefix(prefix: str) -> int | None:
+    """Layer index out of a linear's prefix.
+
+    Cannot index a fixed position: text-only models give
+    ``model.layers.N.self_attn.o_proj`` while multimodal wrappers give
+    ``language_model.model.layers.N.self_attn.o_proj``. Locate ``layers``
+    and take the segment after it.
+    """
+    parts = prefix.split(".")
+    for i, part in enumerate(parts[:-1]):
+        if part == "layers" and parts[i + 1].isdigit():
+            return int(parts[i + 1])
+    return None
 
 
 @dataclass
@@ -67,6 +88,11 @@ class WeightPrefetchMethod:
             enable=weight_prefetch_config.enabled and not self.is_moe,
             prefetch_ratio=weight_prefetch_config.prefetch_ratio.get("mlp", {}) or {"gate_up": 1.0, "down": 1.0},
         )
+        self.is_qwen_dense = (
+            not self.is_moe
+            and get_current_vllm_config().model_config.hf_text_config.model_type == "qwen3_5_text"
+        )
+        self.use_qwen_dense_mlp_prefetch = self.is_qwen_dense and self.mlp.enable
 
     def maybe_prefetch_attn_weight_preprocess(
         self, layer_cls_name: str, weight: torch.Tensor, start_flag: torch.Tensor
@@ -76,11 +102,15 @@ class WeightPrefetchMethod:
 
         prefix = self.attn.linear_prefix_map.get(layer_cls_name, "")
         weight_size = weight.data.element_size() * weight.data.numel() * self.attn.prefetch_ratio.get(prefix, 0)
+        if weight_size <= 0:
+            return
 
         torch.ops.vllm.prefetch_preprocess(weight=weight, start_flag=start_flag, max_weight_size=int(weight_size))
 
     def maybe_prefetch_attn_weight_postprocess(self, layer_cls_name: str, stop_flag: torch.Tensor) -> None:
         if not self.attn.enable or layer_cls_name not in self.attn.linear_prefix_map:
+            return
+        if self.attn.prefetch_ratio.get(self.attn.linear_prefix_map[layer_cls_name], 0) <= 0:
             return
 
         torch.ops.vllm.prefetch_postprocess(stop_flag)
@@ -116,7 +146,10 @@ class WeightPrefetchMethod:
             return None
 
         # layer_idx is subtracted by 1 because it was incremented by 1 at layernorm.
-        layer = model_instance.model.layers[layer_idx - 1]
+        layers = layers_of_model_instance(model_instance)
+        if layers is None or layer_idx - 1 >= len(layers):
+            return None
+        layer = layers[layer_idx - 1]
         experts = None
         if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
             experts = layer.mlp.experts
@@ -134,7 +167,9 @@ class WeightPrefetchMethod:
     def maybe_prefetch_mlp_weight_preprocess(
         self, prefetch_layer_name: str, x_dependency: torch.Tensor | None, curr_layer_prefix: str | None = None
     ):
-        if not self.mlp.enable:
+        # Qwen3.5 dense layers own both prefetch boundaries explicitly. Do not
+        # also launch the legacy self_attn/activation hooks or advance a cursor.
+        if not self.mlp.enable or self.use_qwen_dense_mlp_prefetch:
             self.mlp.is_active_this_forward = False
             return
 
@@ -164,26 +199,37 @@ class WeightPrefetchMethod:
         # start point of gate_up_proj weight prefetch
         if curr_layer_prefix.split(".")[-2] == "self_attn":
             model_instance = _EXTRA_CTX.model_instance
-            layer_idx = int(curr_layer_prefix.split(".")[2])
-            weight = model_instance.model.layers[layer_idx].mlp.gate_up_proj.weight  # type: ignore
+            layer_idx = layer_idx_from_prefix(curr_layer_prefix)
+            layers = layers_of_model_instance(model_instance)
+            if layer_idx is None or layers is None:
+                return
+            weight = layers[layer_idx].mlp.gate_up_proj.weight  # type: ignore
             weight_size = (
                 weight.data.element_size() * weight.data.numel() * self.mlp.prefetch_ratio.get(self.MLP_GATE_UP, 0)
             )
             if weight_size > MAX_PREFETCH_WEIGHT_SIZE:
                 weight_size = MAX_PREFETCH_WEIGHT_SIZE
+            if weight_size <= 0:
+                return
             torch.ops.vllm.prefetch_preprocess(weight=weight, start_flag=x_dependency, max_weight_size=int(weight_size))
             _EXTRA_CTX.prefetch_mlp_gate_up_proj = True
 
     def _maybe_prefetch_mlp_down_weight_preprocess(self, x_dependency: torch.Tensor, forward_context: ForwardContext):
         layer_idx = _EXTRA_CTX.layer_idx
         model_instance = _EXTRA_CTX.model_instance
-        weight = model_instance.model.layers[layer_idx].mlp.down_proj.weight  # type: ignore
+        layers = layers_of_model_instance(model_instance)
+        if layers is None or layer_idx is None or layer_idx >= len(layers):
+            return
+        weight = layers[layer_idx].mlp.down_proj.weight  # type: ignore
         weight_size = weight.data.element_size() * weight.data.numel() * self.mlp.prefetch_ratio.get(self.MLP_DOWN, 0)
+        # Legacy models still need to advance when only gate/up is enabled.
+        _EXTRA_CTX.layer_idx = layer_idx + 1
+        if weight_size <= 0:
+            return
         if weight_size > MAX_PREFETCH_WEIGHT_SIZE:
             weight_size = MAX_PREFETCH_WEIGHT_SIZE
         torch.ops.vllm.prefetch_preprocess(weight=weight, start_flag=x_dependency, max_weight_size=int(weight_size))
         _EXTRA_CTX.prefetch_mlp_down_proj = True
-        _EXTRA_CTX.layer_idx = layer_idx + 1  # type: ignore
 
     def maybe_prefetch_mlp_weight_postprocess(self, stop_flag: torch.Tensor):
         if not self.mlp.is_active_this_forward:
