@@ -12,8 +12,7 @@ from vllm_ascend.utils import get_inner_model, is_moe_model
 
 SUPPORTED_MODULES = ["attn", "mlp", "moe"]
 MOE_PREFETCH_TOKEN_THRESHOLD = 96
-MAX_PREFETCH_WEIGHT_SIZE = 18 * 1024 * 1024
-
+MAX_PREFETCH_WEIGHT_SIZE = 40 * 1024 * 1024
 
 def layers_of_model_instance(model_instance) -> list | None:
     """Decoder layer list, for text-only and multimodal-wrapped models alike."""
