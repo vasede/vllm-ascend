@@ -308,6 +308,38 @@ def _chunk_gated_delta_rule_fla_npu(
     return o, final_state
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def rearrange_mixed_qkv(self, mixed_qkv):
+        """Split packed qkv into (1, seq, heads, dim) without the extra copy.
+
+        Upstream concatenates the three flattened splits into one buffer and
+        slices it back out, so that torch.compile on CUDA collapses the work
+        into a single copy kernel. On NPU it does not collapse: the profile
+        shows 3x Slice plus a separate ConcatD (4.25us/layer at TP4), i.e. the
+        whole tensor is copied twice where once is enough.
+
+        contiguous() is required, not just reshape: a split keeps the parent row
+        stride (2560 at TP4) and reshape to (1, seq, h, d) is expressible as a
+        view, so it would copy nothing and leave q/k non-contiguous. l2norm_fwd
+        then calls view(-1, D) on them, whose kernel hardcodes row stride == N,
+        and that view raises. So materialize each split once, and only skip the
+        second copy that the cat was doing.
+        """
+        if mixed_qkv is None:
+            return None, None, None
+
+        seq_len = mixed_qkv.shape[0]
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+
+        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+
+        return (
+            query.contiguous().view(1, seq_len, -1, self.head_k_dim),
+            key.contiguous().view(1, seq_len, -1, self.head_k_dim),
+            value.contiguous().view(1, seq_len, -1, self.head_v_dim),
+        )
+
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
             return self.split_ba(ba)
