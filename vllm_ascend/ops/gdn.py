@@ -462,6 +462,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+        # Set when a mixed batch runs the decode conv1d kernel separately.
+        decode_conv_qkv = None
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -550,28 +552,72 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
                 else:
                     conv_weights_T = conv_weights.transpose(0, 1)
-                    # activation_num = 1 if self.activation else 0
-                    # mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    # print(f"=====================query_start_loc_opt:{query_start_loc_opt.get_device()}=================")
                     
                     if cache_indices_opt.dim() == 1:
                         cache_indices=cache_indices_opt.contiguous()
                     elif cache_indices_opt.dim() == 2:
                         cache_indices=cache_indices_opt[:, 0].contiguous()
                     
+                    # Mixed non-spec batch: drive the two conv1d kernels separately so
+                    # each side already carries the layout its core-attention op wants.
+                    # Decode rows lead the non-spec batch (the builder rebases prefill
+                    # offsets by num_decode_tokens), so both slices stay contiguous.
+                    split_conv = spec_sequence_masks is None and attn_metadata.num_decodes > 0
+                    if split_conv:
+                        num_decodes_conv = attn_metadata.num_decodes
+                        num_decode_tokens_conv = attn_metadata.num_decode_tokens
+                        decode_conv_meta = attn_metadata.non_spec_decode_metadata.causal_conv1d
+                        if decode_conv_meta.cache_indices.dim() == 1:
+                            decode_conv_state_indices = decode_conv_meta.cache_indices[
+                                :num_decodes_conv
+                            ].contiguous()
+                        else:
+                            decode_conv_state_indices = decode_conv_meta.cache_indices[
+                                :num_decodes_conv, 0
+                            ].contiguous()
+                        # causal_conv1d_update keeps token-major [T, N*D];
+                        # rearrange_mixed_qkv then yields TND, which
+                        # npu_recurrent_gated_delta_rule consumes directly -- no
+                        # transpose of a head-first prefill result any more.
+                        decode_conv_out = causal_conv1d_update(
+                            mixed_qkv_non_spec[:num_decode_tokens_conv],
+                            weight=conv_weights_T,
+                            conv_state=self_kv_cache[0],
+                            bias=self.conv1d.bias,
+                            conv_state_indices=decode_conv_state_indices,
+                            num_accepted_tokens=None,
+                            activation=self.activation,
+                        )
+                        decode_conv_qkv = self.rearrange_mixed_qkv(decode_conv_out)
+                        # Prefill-only view. prefill_query_start_loc is already rebased
+                        # to 0 by the builder; the per-row metadata is sliced past the
+                        # decode rows exactly like prefill_has_initial_state is.
+                        prefill_conv_input = mixed_qkv_non_spec[num_decode_tokens_conv:]
+                        prefill_qsl_conv = attn_metadata.prefill_query_start_loc
+                        prefill_cache_indices_conv = cache_indices[num_decodes_conv:]
+                        prefill_initial_state_conv = (
+                            initial_state_mode_opt[num_decodes_conv:]
+                            if initial_state_mode_opt is not None
+                            else None
+                        )
+                    else:
+                        prefill_conv_input = mixed_qkv_non_spec
+                        prefill_qsl_conv = query_start_loc_opt
+                        prefill_cache_indices_conv = cache_indices
+                        prefill_initial_state_conv = initial_state_mode_opt
+
+                    # NTD (head-first [N, T, D]) for npu_chunk_gated_delta_rule_fwd.
                     mixed_qkv_non_spec_output = causal_conv1d_fn(
-                        mixed_qkv_non_spec,
+                        prefill_conv_input,
                         conv_weights_T,
                         conv_states=self_kv_cache[0],
                         bias=self.conv1d.bias,
-                        query_start_loc=query_start_loc_opt,
-                        cache_indices=cache_indices,
-                        has_initial_state=initial_state_mode_opt,
-                        # num_accepted_tokens_opt=None,
+                        query_start_loc=prefill_qsl_conv,
+                        cache_indices=prefill_cache_indices_conv,
+                        has_initial_state=prefill_initial_state_conv,
                         activation=self.activation,
                         pad_slot_id=PAD_SLOT_ID,
                         head_num=(self.num_k_heads+self.num_k_heads+self.num_v_heads)//self.tp_size
-                        # run_mode=0,
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
                     query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
@@ -640,6 +686,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         fused_initial_state = None
         fuse_preamble = False
         if fuse_preamble:
+            # Stale w.r.t. the split conv1d path: q/k below are prefill-only now,
+            # while the y_q/y_k slicing further down still assumes they span the
+            # whole batch. Re-enabling this for a mixed batch would double-slice.
+            assert not split_non_spec, (
+                "fused GDN preamble needs full-batch q/k; the split conv1d path "
+                "hands it prefill-only tensors"
+            )
             # q/k cover the WHOLE batch: l2norm is a per-token row reduction over the
             # feature dim, so normalizing all rows and slicing is bit-identical to
             # normalizing each slice on its own. That lets the decode branch reuse
@@ -712,21 +765,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert g_non_spec is not None
             assert beta_non_spec is not None
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            # causal_conv1d_fn emits head-first [N, T, D] (the BNSD layout the
-            # chunkgdn fused chunk kernel consumes), so the token dim is 1 and the
-            # feature dim is already split per head. npu_recurrent_gated_delta_rule
-            # wants TND, hence the transpose. unsqueeze(0) is load-bearing: the
-            # call below squeezes dim 0, which would eat the token dim whenever a
-            # single decode request makes num_decode_tokens == 1.
-            query_decode = (
-                query_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-            )
-            key_decode = (
-                key_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-            )
-            value_decode = (
-                value_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-            )
+            # Already TND: produced by the decode-side causal_conv1d_update above,
+            # so there is nothing to transpose out of the prefill layout.
+            assert decode_conv_qkv is not None
+            query_decode, key_decode, value_decode = decode_conv_qkv
             # chunkgdn use_qk_l2norm_in_kernel only covers the prefill op; the
             # recurrent decode op needs q/k normalized by hand.
             query_decode = l2norm_fwd(query_decode)
@@ -757,11 +799,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert g_non_spec is not None
             assert beta_non_spec is not None
             if split_non_spec:
-                # q/k were already sliced and normalized inside the fused kernel.
-                if fused_prefill_qk is None:
-                    query_non_spec = query_non_spec[:, num_decode_tokens:]
-                    key_non_spec = key_non_spec[:, num_decode_tokens:]
-                value_non_spec = value_non_spec[:, num_decode_tokens:]
+                # q/k/v already cover prefill rows only: the prefill conv1d kernel
+                # above was fed mixed_qkv_non_spec[num_decode_tokens:]. Gating still
+                # runs over the whole batch, so g/beta keep their slice.
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
             if fused_prefill_qk is not None:
