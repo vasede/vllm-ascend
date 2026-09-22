@@ -485,8 +485,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
-        # Set when a mixed batch runs the decode conv1d kernel separately.
-        decode_conv_qkv = None
+        # Set when a mixed batch defers its decode conv1d kernel to section 2.3,
+        # so that it is issued right before the decode GDN op instead of next to
+        # the prefill conv1d. Both stay None on every other path.
+        decode_conv_input = None
+        decode_conv_state_indices = None
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -598,26 +601,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                             decode_conv_state_indices = decode_conv_meta.cache_indices[
                                 :num_decodes_conv, 0
                             ].contiguous()
-                        # causal_conv1d_update keeps token-major [T, N*D];
-                        # rearrange_mixed_qkv then yields TND, which
-                        # npu_recurrent_gated_delta_rule consumes directly -- no
-                        # transpose of a head-first prefill result any more.
-                        decode_conv_out = causal_conv1d_update(
-                            mixed_qkv_non_spec[:num_decode_tokens_conv],
-                            weight=conv_weights_T,
-                            conv_state=self_kv_cache[0],
-                            bias=self.conv1d.bias,
-                            conv_state_indices=decode_conv_state_indices,
-                            num_accepted_tokens=None,
-                            activation=self.activation,
-                        )
-                        decode_conv_qkv = _rearrange_decode_qkv(
-                            decode_conv_out,
-                            self.key_dim // self.tp_size,
-                            self.value_dim // self.tp_size,
-                            self.head_k_dim,
-                            self.head_v_dim,
-                        )
+                        # Preserve decode rows before prefill replaces mixed_qkv_non_spec.
+                        decode_conv_input = mixed_qkv_non_spec[:num_decode_tokens_conv]
                         # Prefill-only view. prefill_query_start_loc is already rebased
                         # to 0 by the builder; the per-row metadata is sliced past the
                         # decode rows exactly like prefill_has_initial_state is.
@@ -650,6 +635,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
                     query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
+
+                    # The decode conv1d kernel itself is deferred to section 2.3
+                    # so the issue order becomes prefill conv1d -> prefill GDN ->
+                    # decode conv1d -> decode GDN. Only the inputs are captured
+                    # here, because the rebind above makes mixed_qkv_non_spec
+                    # prefill-only from this point on.
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)
             # activation_num = 1 if self.activation else 0
@@ -795,33 +786,21 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
-        # 2.2: Process non-spec-decode part in mixed non-spec batches
+        # 2.2: Stage the non-spec-decode gating slices. Both the decode conv1d and
+        # the decode GDN op run in 2.3, after the prefill GDN; the slices have to
+        # be taken here because 2.3 rebinds g_non_spec/beta_non_spec to their
+        # prefill-only views before it gets there.
         if split_non_spec:
             assert g_non_spec is not None
             assert beta_non_spec is not None
-            actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            # Already TND: produced by the decode-side causal_conv1d_update above,
-            # so there is nothing to transpose out of the prefill layout.
-            assert decode_conv_qkv is not None
-            query_decode, key_decode, value_decode = decode_conv_qkv
-            # chunkgdn use_qk_l2norm_in_kernel only covers the prefill op; the
-            # recurrent decode op needs q/k normalized by hand.
-            query_decode = l2norm_fwd(query_decode)
-            key_decode = l2norm_fwd(key_decode)
-
-            core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=query_decode.squeeze(0),
-                key=key_decode.squeeze(0),
-                value=value_decode.squeeze(0),
-                g=g_non_spec[:, :num_decode_tokens].squeeze(0),
-                beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
-                state=ssm_state,
-                scale=key_decode.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
-            ).unsqueeze(0)
-        else:
-            core_attn_out_decode = None
+            decode_actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
+            # None here means the conv section never captured the decode rows,
+            # i.e. the PCP branch, which does not implement the split path.
+            assert decode_conv_input is not None
+            assert decode_conv_state_indices is not None
+            g_decode = g_non_spec[:, :num_decode_tokens]
+            beta_decode = beta_non_spec[:, :num_decode_tokens]
+        core_attn_out_decode = None
 
         # 2.3: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -908,6 +887,49 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
                 )
             if split_non_spec:
+                # Decode conv1d runs here, after the prefill GDN, so the whole
+                # decode chain (conv1d -> l2norm -> GDN) trails the prefill chain.
+                # Safe against the prefill conv1d that already ran: the two write
+                # disjoint conv-state slots, and decode_conv_input is a view on the
+                # decode rows, which the prefill kernel never reads or writes.
+                # The decode output stays token-major for the recurrent op.
+                decode_conv_out = causal_conv1d_update(
+                    decode_conv_input,
+                    weight=conv_weights_T,
+                    conv_state=self_kv_cache[0],
+                    bias=self.conv1d.bias,
+                    conv_state_indices=decode_conv_state_indices,
+                    num_accepted_tokens=None,
+                    activation=self.activation,
+                )
+                # Yields TND, which npu_recurrent_gated_delta_rule consumes directly.
+                query_decode, key_decode, value_decode = _rearrange_decode_qkv(
+                    decode_conv_out,
+                    self.key_dim // self.tp_size,
+                    self.value_dim // self.tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+                # Decode GDN op runs after the prefill one. Both update ssm_state,
+                # but at disjoint rows: prefill_state_indices is
+                # non_spec_state_indices_tensor[num_decodes:] (builder) while decode
+                # uses [:num_decodes], so the order does not affect the result.
+                # The chunk op only normalizes the prefill slice.
+                query_decode = l2norm_fwd(query_decode)
+                key_decode = l2norm_fwd(key_decode)
+                core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                    query=query_decode.squeeze(0),
+                    key=key_decode.squeeze(0),
+                    value=value_decode.squeeze(0),
+                    g=g_decode.squeeze(0),
+                    beta=beta_decode.squeeze(0),
+                    state=ssm_state,
+                    scale=key_decode.shape[-1] ** -0.5,
+                    actual_seq_lengths=decode_actual_seq_lengths,
+                    ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                ).unsqueeze(0)
+                # Concat order stays decode-first: it must match the batch token
+                # layout, which is independent of the execution order above.
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],
                     dim=1,
