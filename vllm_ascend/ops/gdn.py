@@ -38,6 +38,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.gating_l2norm import gating_l2norm_qk
 from vllm_ascend.ops.triton.fla.utils import (
     clear_ssm_states,
     gating_gather_clear_l2norm_qk,
@@ -664,6 +665,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 fused_prefill_qk = (y_q[:, num_decode_tokens:], y_k[:, num_decode_tokens:])
             else:
                 fused_prefill_qk = (y_q, y_k)
+        elif spec_sequence_masks is None and attn_metadata.num_decodes > 0:
+            # The mixed convolution output is [H, T, D]; pure decode already
+            # provides [1, T, H, D]. Pass views so the fused kernel also handles
+            # the layout conversion, without separate Q/K contiguous copies.
+            if split_non_spec:
+                decode_q = query_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0)
+                decode_k = key_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0)
+            else:
+                decode_q, decode_k = query_non_spec, key_non_spec
+            g, beta, decode_q, decode_k = gating_l2norm_qk(
+                decode_q, decode_k, self.A_log, a, b, self.dt_bias
+            )
+            fused_decode_qk = (decode_q, decode_k)
         else:
             g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
@@ -718,19 +732,18 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # wants TND, hence the transpose. unsqueeze(0) is load-bearing: the
             # call below squeezes dim 0, which would eat the token dim whenever a
             # single decode request makes num_decode_tokens == 1.
-            query_decode = (
-                query_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-            )
-            key_decode = (
-                key_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-            )
+            if fused_decode_qk is not None:
+                query_decode, key_decode = fused_decode_qk
+            else:
+                query_decode = l2norm_fwd(
+                    query_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+                )
+                key_decode = l2norm_fwd(
+                    key_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+                )
             value_decode = (
                 value_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0).contiguous()
             )
-            # chunkgdn use_qk_l2norm_in_kernel only covers the prefill op; the
-            # recurrent decode op needs q/k normalized by hand.
-            query_decode = l2norm_fwd(query_decode)
-            key_decode = l2norm_fwd(key_decode)
 
             core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                 query=query_decode.squeeze(0),
@@ -839,8 +852,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         elif attn_metadata.num_decodes > 0:
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            query_non_spec = l2norm_fwd(query_non_spec)
-            key_non_spec = l2norm_fwd(key_non_spec)
+            if fused_decode_qk is not None:
+                query_non_spec, key_non_spec = fused_decode_qk
+            else:
+                query_non_spec = l2norm_fwd(query_non_spec)
+                key_non_spec = l2norm_fwd(key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
