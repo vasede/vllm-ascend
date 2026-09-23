@@ -38,10 +38,12 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
-from vllm_ascend.ops.triton.fla.gating_l2norm import gating_l2norm_qk
+from vllm_ascend.ops.triton.fla.gating_l2norm import (
+    gating_gather_clear_decode_l2norm_qk,
+    gating_l2norm_qk,
+)
 from vllm_ascend.ops.triton.fla.utils import (
     clear_ssm_states,
-    gating_gather_clear_l2norm_qk,
     preamble_fusion_enabled,
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
@@ -620,64 +622,44 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # gdn_fused_chunk_op ("cann" or "fla_npu"). Both fused ops only support the
         # non-PCP case; keep the Triton pipeline as default.
         use_fused_chunk = get_ascend_config().enable_gdn_fused_chunk and get_pcp_group().world_size == 1
-        # The whole preamble - gating, the ssm gather, the clear, the bf16 cast and
-        # both l2norms - collapses into one Triton launch. Gating is elementwise over
-        # tokens so it covers the full batch, while the gather/clear/l2norm segments
-        # cover only the prefill slice; the kernel sizes those independently
-        # (NUM_BATCHES vs M), so a mixed decode+prefill batch is handled by giving it
-        # full-range a/b and prefill-sliced q/k. Spec-decode still needs the
-        # index_select path below, and VLLM_ASCEND_GDN_FUSE_CLEAR_L2NORM=0 keeps the
-        # original per-op path.
-        fuse_preamble = (
+        # State preparation is independent of decode Q/K norm. Prefill Q/K
+        # stay raw here: the selected chunk implementation owns their norm.
+        fuse_state = (
             use_fused_chunk
             and preamble_fusion_enabled()
             and spec_sequence_masks is None
             and attn_metadata.num_prefills > 0
         )
-
-        # Set by the fused call so the two branches below reuse its outputs.
-        fused_prefill_qk = None
         fused_decode_qk = None
         fused_initial_state = None
-        fuse_preamble = False
-        if fuse_preamble:
-            # q/k cover the WHOLE batch: l2norm is a per-token row reduction over the
-            # feature dim, so normalizing all rows and slicing is bit-identical to
-            # normalizing each slice on its own. That lets the decode branch reuse
-            # these outputs instead of issuing two more l2norm launches (measured at
-            # 291us of host time each on the eager path).
-            g, beta, fused_initial_state, y_q, y_k = gating_gather_clear_l2norm_qk(
-                ssm_state,
-                attn_metadata.prefill_state_indices,
-                attn_metadata.prefill_has_initial_state,
-                query_non_spec,
-                key_non_spec,
-                self.A_log,
-                a,
-                b,
-                self.dt_bias,
-                out_dtype=torch.bfloat16,
-            )
-            # Slicing dim 1 of a [1, T, H, D] contiguous tensor stays contiguous
-            # because dim 0 has size 1, so both slices are still flat-indexable.
-            if split_non_spec:
-                fused_decode_qk = (y_q[:, :num_decode_tokens], y_k[:, :num_decode_tokens])
-                fused_prefill_qk = (y_q[:, num_decode_tokens:], y_k[:, num_decode_tokens:])
-            else:
-                fused_prefill_qk = (y_q, y_k)
-        elif spec_sequence_masks is None and attn_metadata.num_decodes > 0:
-            # The mixed convolution output is [H, T, D]; pure decode already
-            # provides [1, T, H, D]. Pass views so the fused kernel also handles
-            # the layout conversion, without separate Q/K contiguous copies.
+        decode_q, decode_k = None, None
+        if spec_sequence_masks is None and attn_metadata.num_decodes > 0:
+            # Pass strided views to fuse the mixed batch's [H,T,D] -> [1,T,H,D]
+            # conversion with decode norm, avoiding Q/K contiguous copies.
             if split_non_spec:
                 decode_q = query_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0)
                 decode_k = key_non_spec[:, :num_decode_tokens].transpose(0, 1).unsqueeze(0)
             else:
                 decode_q, decode_k = query_non_spec, key_non_spec
-            g, beta, decode_q, decode_k = gating_l2norm_qk(
+        if fuse_state:
+            g, beta, fused_initial_state, norm_q, norm_k = gating_gather_clear_decode_l2norm_qk(
+                ssm_state,
+                attn_metadata.prefill_state_indices,
+                attn_metadata.prefill_has_initial_state,
+                decode_q,
+                decode_k,
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+            )
+            if decode_q is not None:
+                fused_decode_qk = (norm_q, norm_k)
+        elif decode_q is not None:
+            g, beta, norm_q, norm_k = gating_l2norm_qk(
                 decode_q, decode_k, self.A_log, a, b, self.dt_bias
             )
-            fused_decode_qk = (decode_q, decode_k)
+            fused_decode_qk = (norm_q, norm_k)
         else:
             g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
@@ -770,23 +752,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert g_non_spec is not None
             assert beta_non_spec is not None
             if split_non_spec:
-                # q/k were already sliced and normalized inside the fused kernel.
-                if fused_prefill_qk is None:
-                    query_non_spec = query_non_spec[:, num_decode_tokens:]
-                    key_non_spec = key_non_spec[:, num_decode_tokens:]
+                query_non_spec = query_non_spec[:, num_decode_tokens:]
+                key_non_spec = key_non_spec[:, num_decode_tokens:]
                 value_non_spec = value_non_spec[:, num_decode_tokens:]
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
-            if fused_prefill_qk is not None:
-                query_non_spec, key_non_spec = fused_prefill_qk
 
             if use_fused_chunk:
-                # The fused op's state layout [N, Nv, Dv, Dk] matches ssm_state
-                # directly, so no transpose is needed. The gather gives us a fresh
-                # buffer, already bf16 for the fused op, so the Cast/contiguous
-                # below are no-ops.
+                # Preserve cache dtype and [N,Nv,Dv,Dk] layout. Any conversion
+                # required by a particular chunk backend remains in its wrapper.
                 if fused_initial_state is not None:
-                    # Gathered, cleared and cast to bf16 by the fused kernel above.
+                    # Gathered and cleared in the same launch as gating/decode norm.
                     initial_state = fused_initial_state
                 else:
                     # Advanced indexing already returns a copy, safe to clear in place.
@@ -818,7 +794,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     cu_seqlens=prefill_query_start_loc,
                     scale=key_non_spec.shape[-1] ** -0.5,
                     actual_seq_lengths=chunk_meta.actual_seq_lengths,
-                    qk_normalized=fuse_preamble,
+                    qk_normalized=False,
                     **host_kwargs,
                 )
                 # Kept on the aclnn path on purpose: measured on this stack a Triton
@@ -887,7 +863,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-
 
 
 
