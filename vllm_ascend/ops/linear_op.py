@@ -479,7 +479,16 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         assert self.quant_method is not None
         output = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+            # Fork the gate_up weight prefetch here, between this MatMul and the
+            # collective, so it overlaps the AllReduce instead of only the
+            # AddRmsNorm that prefetch_gemma_rms_norm can reach. That fallback
+            # stands down whenever _attention_gate_up_target() is eligible, so
+            # without this call gate_up is never prefetched at all.
+            # Pass self.prefix, not self.unique_prefix: the latter gains a
+            # .unique_prefixN suffix on collision and would fail the target lookup.
+            from vllm_ascend.ops.mlp_weight_prefetch import attention_all_reduce_with_prefetch
+
+            output = attention_all_reduce_with_prefetch(output, self.prefix)
         return output
 
     def update_attrs(self):

@@ -124,26 +124,39 @@ def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> tor
     return x
 
 
-def _prefetch_preprocess_impl(weight: torch.Tensor, start_flag: torch.Tensor, max_weight_size: int) -> None:
+# Both prefetch ops return a tensor rather than None on purpose. With no return
+# value and mutates_args=[], Dynamo sees a pure side-effect-free node with no
+# consumer and is free to DCE it or reorder it across the collective it is meant
+# to overlap with -- which silently disables prefetch under torch.compile.
+# Returning the flag lets the caller thread it into the graph as a real data
+# dependency. start_flag stays optional because the MoE gating path issues a
+# prefetch with no dependency tensor.
+def _prefetch_preprocess_impl(
+    weight: torch.Tensor, start_flag: torch.Tensor | None, max_weight_size: int
+) -> torch.Tensor:
     calculation_stream = torch_npu.npu.current_stream()
     weight_prefetch_stream = prefetch_stream()
     weight_prefetch_stream.wait_stream(calculation_stream)
     with npu_stream_switch(weight_prefetch_stream):
         maybe_npu_prefetch(inputs=weight, dependency=start_flag, max_size=max_weight_size)
+    return weight if start_flag is None else start_flag
 
 
-def _prefetch_preprocess_impl_fake(weight: torch.Tensor, start_flag: torch.Tensor, max_weight_size: int) -> None:
-    return
+def _prefetch_preprocess_impl_fake(
+    weight: torch.Tensor, start_flag: torch.Tensor | None, max_weight_size: int
+) -> torch.Tensor:
+    return weight if start_flag is None else start_flag
 
 
-def _prefetch_postprocess_impl(stop_flag: torch.Tensor) -> None:
+def _prefetch_postprocess_impl(stop_flag: torch.Tensor) -> torch.Tensor:
     calculation_stream = torch_npu.npu.current_stream()
     weight_prefetch_stream = prefetch_stream()
     calculation_stream.wait_stream(weight_prefetch_stream)
+    return stop_flag
 
 
-def _prefetch_postprocess_impl_fake(stop_flag: torch.Tensor) -> None:
-    return
+def _prefetch_postprocess_impl_fake(stop_flag: torch.Tensor) -> torch.Tensor:
+    return stop_flag
 
 
 def _maybe_all_reduce_tensor_model_parallel_impl(final_hidden_states: torch.Tensor) -> torch.Tensor:

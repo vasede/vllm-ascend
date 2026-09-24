@@ -34,7 +34,8 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
-from vllm_ascend.utils import is_310p
+from vllm_ascend.ops.mlp_weight_prefetch import dense_mlp_with_prefetch
+from vllm_ascend.utils import get_weight_prefetch_method, is_310p
 
 _GDN_PATCH_TARGET = _GDNBaseCls
 
@@ -42,6 +43,20 @@ _GDN_PATCH_TARGET = _GDNBaseCls
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
+        # Resolve o_proj's prefetch ratio once: the split op issues the fetch
+        # and attention_gate_with_prefetch() joins it, and the two guards must
+        # agree. linear_attn gets the same treatment inside gdn.py.
+        prefetch_method = get_weight_prefetch_method()
+        o_proj_ratio = (
+            float(prefetch_method.attn.prefetch_ratio.get("o", 0))
+            if prefetch_method is not None and prefetch_method.attn.enable
+            else 0.0
+        )
+        # Only the fused-kernel branch below reaches the issue site, and this
+        # forward is patched onto Qwen3NextAttention globally, so the other
+        # branch must not close a fence nothing opened.
+        if "qwen3_5" not in self.config.model_type or not self.attn_output_gate:
+            o_proj_ratio = 0.0
         if "qwen3_5" in self.config.model_type:
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
             if cos_sin.device != qkv.device:
@@ -62,6 +77,8 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
                 is_interleaved=self.rotary_emb.mrope_interleaved,
                 rope_dim=self.rotary_emb.rotary_dim,
                 has_gate=self.attn_output_gate,
+                o_proj_weight=self.o_proj.weight if o_proj_ratio > 0 else None,
+                o_proj_ratio=o_proj_ratio,
             )
         else:
             if self.attn_output_gate:
@@ -82,8 +99,14 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
         attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if o_proj_ratio > 0:
+                # Joins the fetch the split op forked before the attention core.
+                attn_output = torch.ops.vllm.attention_gate_with_prefetch(
+                    attn_output, gate, self.o_proj.weight, o_proj_ratio
+                )
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output[:], _ = self.o_proj(attn_output)
 
@@ -134,8 +157,17 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
                 hidden_states = hidden_states * (self.attn_layer_scale.to(hidden_states.dtype) + 1)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        weight_prefetch_method = get_weight_prefetch_method()
+        if (
+            weight_prefetch_method is not None
+            and weight_prefetch_method.use_qwen_dense_mlp_prefetch
+            and hasattr(self.mlp, "gate_up_proj")
+        ):
+            hidden_states, residual = dense_mlp_with_prefetch(self, hidden_states, residual, weight_prefetch_method)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
