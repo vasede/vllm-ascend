@@ -217,7 +217,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "swiglu_group_quant"
         "load_index_kv_cache"
         "indexer_compress_epilog_v2"
-        "recurrent_gated_delta_rule"
         "chunk_gated_delta_rule_fwd_h"
         "store_kv_block"
         "store_kv_block_metadata"

@@ -58,6 +58,7 @@ try:
     import fla_npu  # noqa: F401
     
     from fla_npu.ops.ascendc import npu_chunk_gated_delta_rule_fwd
+    from fla_npu.ops.ascendc import npu_recurrent_gated_delta_rule
 except ImportError:
     npu_chunk_gated_delta_rule_fwd = None
 
@@ -771,7 +772,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             # The custom op extends dtype support (e.g. float32 state) and is
             # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
-            core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_spec = npu_recurrent_gated_delta_rule(
                 query=query_spec.squeeze(0),
                 key=key_spec.squeeze(0),
                 value=value_spec.squeeze(0),
@@ -917,7 +918,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # The chunk op only normalizes the prefill slice.
                 query_decode = l2norm_fwd(query_decode)
                 key_decode = l2norm_fwd(key_decode)
-                core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                core_attn_out_decode = npu_recurrent_gated_delta_rule(
                     query=query_decode.squeeze(0),
                     key=key_decode.squeeze(0),
                     value=value_decode.squeeze(0),
@@ -940,7 +941,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_non_spec = l2norm_fwd(key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
-            core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_non_spec = npu_recurrent_gated_delta_rule(
                 query=query_non_spec.squeeze(0),
                 key=key_non_spec.squeeze(0),
                 value=value_non_spec.squeeze(0),
