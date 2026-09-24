@@ -430,9 +430,9 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         self.matmul_comm_mode = None
         group = self.comm_group
         if get_ascend_device_type() == AscendDeviceType.A5 and self.tp_size > 1:
-            group = get_matmul_allreduce_group()
+            group = get_ccu_sched_group()
             assert group.ranks == self.comm_group.ranks, "MC2 and TP rank ordering must match"
-            self.matmul_comm_mode = "ai_cpu"
+            self.matmul_comm_mode = "ccu"
         self.hcomm_info = self.get_hcomm_info(group.device_group)
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
