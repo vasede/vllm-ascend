@@ -606,7 +606,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         ].transpose(-1, -2)
                     query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
                 else:
-                   conv_weights_T = _cached_conv_weights_t(self)
+                    conv_weights_T = _cached_conv_weights_t(self)
 
                     if cache_indices_opt.dim() == 1:
                         cache_indices=cache_indices_opt.contiguous()
