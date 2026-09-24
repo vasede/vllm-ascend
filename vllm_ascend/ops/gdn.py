@@ -546,8 +546,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 max_query_len=spec_state_indices_tensor.size(-1),
             )
             mixed_qkv_spec = output_spec
-            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-
+            # Same three contiguous components without the concat that
+            # upstream's rearrange_mixed_qkv adds for torch.compile's sake;
+            # on NPU that cat is a fourth pass over the data for nothing.
+            query_spec, key_spec, value_spec = _rearrange_decode_qkv(
+                mixed_qkv_spec,
+                self.key_dim // self.tp_size,
+                self.value_dim // self.tp_size,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+            
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
