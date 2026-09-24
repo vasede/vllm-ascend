@@ -286,7 +286,7 @@ def _chunk_gated_delta_rule_fla_npu(
     # backward pass, which prefill never runs, but they cannot be skipped: passing
     # disable_recompute=True drops them from the output tuple and the aclnn entry then
     # rejects the call with aclnnStatus=169104, so keep the default and discard them.
-    o, final_state = npu_chunk_gated_delta_rule_fwd(
+    o, final_state, _, _, _, _, _, _, _, _ = npu_chunk_gated_delta_rule_fwd(
         q,
         k,
         v,
@@ -295,7 +295,7 @@ def _chunk_gated_delta_rule_fla_npu(
         initial_state=initial_state,
         use_exp2=True,
         use_qk_l2norm_in_kernel=True,
-        disable_recompute=True,
+        disable_recompute=False,
         state_v_first=True,
         output_final_state=True,
         chunk_size=chunk_size,
