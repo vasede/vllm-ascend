@@ -331,6 +331,30 @@ def _rearrange_decode_qkv(
     )
 
 
+def _cached_conv_weights_t(layer) -> torch.Tensor:
+    """Materialise conv1d weight^T once per layer instead of once per step.
+
+    The conv1d weight is constant after loading but the aclnn op wants it
+    transposed, and a plain .transpose(0, 1) is non-contiguous, so every call
+    used to pay a Contiguous_Transpose kernel. Cache the contiguous result on
+    the layer, re-deriving it only if the weight storage is swapped out.
+
+    This is a module-level helper on purpose: the Qwen3.5 GDN class is built by
+    copying selected methods onto the upstream class (see
+    patch/worker/patch_qwen3_5.py), so a new method defined here would not be
+    carried over.
+    """
+    w = layer.conv1d.weight
+    key = (w.data_ptr(), tuple(w.shape))
+    cached = getattr(layer, "_conv_weights_t_cache", None)
+    if cached is not None and getattr(layer, "_conv_weights_t_src", None) == key:
+        return cached
+    cached = w.view(w.size(0), w.size(2)).transpose(0, 1).contiguous()
+    layer._conv_weights_t_cache = cached
+    layer._conv_weights_t_src = key
+    return cached
+
+
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
@@ -494,7 +518,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            conv_weights_T = conv_weights.transpose(0, 1)
+            conv_weights_T = _cached_conv_weights_t(self)
             # activation_num = 1 if self.activation else 0
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
@@ -504,7 +528,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_causal_conv1d_meta.cache_indices.contiguous()
             elif spec_causal_conv1d_meta.cache_indices.dim() == 2:
                 conv_state_indices=spec_causal_conv1d_meta.cache_indices[:, 0].contiguous()
-            
+           
+            # See the out= note on the decode call below: without it the op ends
+            # in a dead `x.copy_(result)`, which is a ViewCopy kernel here because
+            # in the steady MTP state mixed_qkv_spec aliases mixed_qkv.
             output_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 weight=conv_weights_T,
@@ -514,6 +541,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_causal_conv1d_meta.cache_indices[:, 0].contiguous(),
                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
                 activation=self.activation,
+                out=torch.empty_like(mixed_qkv_spec),
                 # pad_slot_id=PAD_SLOT_ID,
                 max_query_len=spec_state_indices_tensor.size(-1),
             )
@@ -528,7 +556,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cache_indices_opt = non_spec_causal_conv1d_meta.cache_indices
                 initial_state_mode_opt = non_spec_causal_conv1d_meta.initial_state_mode
                 if get_pcp_group().world_size > 1:
-                    conv_weights_T = conv_weights.transpose(0, 1)
+                    conv_weights_T = _cached_conv_weights_t(self)
                     # activation_num = 1 if self.activation else 0
                     non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
                     assert non_spec_query_start_loc is not None
@@ -578,8 +606,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         ].transpose(-1, -2)
                     query_non_spec, key_non_spec, value_non_spec = torch.split(mixed_qkv_non_spec, [self.num_k_heads//self.tp_size, self.num_k_heads//self.tp_size, self.num_v_heads//self.tp_size], dim=-3)
                 else:
-                    conv_weights_T = conv_weights.transpose(0, 1)
-                    
+                   conv_weights_T = _cached_conv_weights_t(self)
+
                     if cache_indices_opt.dim() == 1:
                         cache_indices=cache_indices_opt.contiguous()
                     elif cache_indices_opt.dim() == 2:
@@ -643,7 +671,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # here, because the rebind above makes mixed_qkv_non_spec
                     # prefill-only from this point on.
         elif attn_metadata.num_decodes > 0:
-            conv_weights_T = conv_weights.transpose(0, 1)
+            conv_weights_T = _cached_conv_weights_t(self)
             # activation_num = 1 if self.activation else 0
             non_spec_causal_conv1d_meta = attn_metadata.non_spec_decode_metadata.causal_conv1d
             non_spec_query_start_loc_device = non_spec_causal_conv1d_meta.query_start_loc
@@ -655,6 +683,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             elif non_spec_causal_conv1d_meta.cache_indices.dim() == 2:
                 conv_state_indices=non_spec_causal_conv1d_meta.cache_indices[:, 0].contiguous()
             
+            # Pass an explicit out= buffer. Without it the fla_npu stable path
+            # ends in `x.copy_(result); return x` to honour its "mutates x"
+            # contract, and since x is a view into mixed_qkv that copy shows up
+            # as a ViewCopy kernel per layer per step. We only consume the
+            # return value, so that write-back is dead: handing the op its own
+            # output buffer takes the early-return branch and drops the kernel.
             output_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
                 weight=conv_weights_T,
@@ -665,6 +699,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # initial_state_mode_opt=None,
                 num_accepted_tokens=None,
                 activation=self.activation,
+                out=torch.empty_like(mixed_qkv_non_spec),
                 # max_query_len=1,
                 # pad_slot_id=PAD_SLOT_ID,
                 # run_mode=1,
