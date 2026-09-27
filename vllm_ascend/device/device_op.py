@@ -1050,7 +1050,11 @@ class BaseDeviceAdaptor:
 
     @staticmethod
     def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
-        return torch.ops._C_ascend.npu_fused_gdn_gating(A_log, a, b, dt_bias.to(A_log.dtype))
+        # gdn.py hands over chunk views of ba; this op wants them dense. The A5
+        # adaptor's Triton kernel takes the stride instead and skips the copy.
+        return torch.ops._C_ascend.npu_fused_gdn_gating(
+            A_log, a.contiguous(), b.contiguous(), dt_bias.to(A_log.dtype)
+        )
 
     @staticmethod
     def split_qkv_rmsnorm_rope(

@@ -10,7 +10,17 @@ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 UNIFIED_BUFFER_SIZE = 1572864
 
 
-@triton.jit(do_not_specialize=["seq_len", "NUM_HEADS", "NUM_BATCHES", "beta", "threshold", "ROW_ITER"])
+@triton.jit(
+    do_not_specialize=[
+        "seq_len",
+        "NUM_HEADS",
+        "NUM_BATCHES",
+        "beta",
+        "threshold",
+        "ROW_ITER",
+        "ab_row_stride",
+    ]
+)
 def fused_gdn_gating_kernel(
     g,
     beta_output,
@@ -23,6 +33,7 @@ def fused_gdn_gating_kernel(
     NUM_BATCHES,
     beta,
     threshold,
+    ab_row_stride,
     BLK_HEADS: tl.constexpr,
     BLK_BATCHES: tl.constexpr,
     ROW_ITER,
@@ -35,14 +46,19 @@ def fused_gdn_gating_kernel(
 
         for col_idx in range(0, COL_ITER):
             head_off = col_idx * BLK_HEADS + tl.arange(0, BLK_HEADS)
-
+            
+            # g/beta_output are freshly allocated and dense, while a/b may be
+            # chunk views of ba that kept the parent row stride.
             off = batch_off[:, None] * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off[None, :]
+            ab_off = (
+                batch_off[:, None] * seq_len * ab_row_stride + i_s * ab_row_stride + head_off[None, :]
+            )
             head_mask = head_off < NUM_HEADS
             mask = head_mask[None, :] & (batch_off[:, None] < NUM_BATCHES)
 
             blk_A_log = tl.load(A_log + head_off, mask=head_mask)
-            blk_a = tl.load(a + off, mask=mask)
-            blk_b = tl.load(b + off, mask=mask)
+            blk_a = tl.load(a + ab_off, mask=mask)
+            blk_b = tl.load(b + ab_off, mask=mask)
             blk_bias = tl.load(dt_bias + head_off, mask=head_mask)
 
             x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)[None, :]
@@ -66,6 +82,13 @@ def fused_gdn_gating_patch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
+    # b/a arrive as chunk views of ba, so the row stride is the parent's. Only
+    # the feature dim has to be dense for the block loads below.
+    if a.stride() != b.stride():
+        raise ValueError(f"fused_gdn_gating: a/b strides must match, got {a.stride()} vs {b.stride()}")
+    if a.stride(1) != 1:
+        raise ValueError(f"fused_gdn_gating: a/b features must be dense, got stride {a.stride(1)}")
+    ab_row_stride = a.stride(0)
 
     num_cores = get_vectorcore_num()
 
@@ -92,6 +115,7 @@ def fused_gdn_gating_patch(
         batch,
         beta,
         threshold,
+        ab_row_stride,
         BLK_HEADS=BLK_HEADS,
         BLK_BATCHES=BLK_BATCHES,
         ROW_ITER=ROW_ITER,

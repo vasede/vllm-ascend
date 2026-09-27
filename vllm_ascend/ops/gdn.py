@@ -403,9 +403,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
+            # Left as chunk views: the A5 gating kernel takes the row stride, and
+            # the AscendC adaptor densifies them itself.
             b, a = self._split_ba_for_tp(ba)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
                 mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -416,9 +416,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
                 ba, _ = self.in_proj_ba(hidden_states)
                 b, a = self._split_ba_for_tp(ba)
-
-                b = b.contiguous()
-                a = a.contiguous()
             else:
                 projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
