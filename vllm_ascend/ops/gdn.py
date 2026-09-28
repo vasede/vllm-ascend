@@ -40,7 +40,9 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import (
     clear_ssm_states,
+    decode_gate_norm_fusion_enabled,
     gating_gather_clear_l2norm_qk,
+    gating_l2norm_qk,
     preamble_fusion_enabled,
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
@@ -787,7 +789,80 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         fused_decode_qk = None
         fused_initial_state = None
         fuse_preamble = False
-        if fuse_preamble:
+        # Decode gate + both q/k l2norms in one launch instead of three. Two shapes
+        # of this: a pure-decode batch fuses right here (its q/k are ready, the
+        # conv1d already ran in section 1.2); a mixed batch cannot, because its
+        # decode conv1d is deferred to 2.3 and the q/k do not exist yet, so gating
+        # is split there into a prefill-only launch here plus a fused decode launch
+        # in 2.3. Slicing gating by token range is bit-exact - see gating_l2norm_qk.
+        fuse_decode_gate_norm = (
+            decode_gate_norm_fusion_enabled()
+            and not fuse_preamble
+            and spec_sequence_masks is None
+            and attn_metadata.num_decodes > 0
+        )
+        fuse_pure_decode = fuse_decode_gate_norm and attn_metadata.num_prefills == 0
+        # Mixed batches only fuse on the split-conv1d path, i.e. non-PCP: the PCP
+        # branch never captures decode_conv_input and so never reaches 2.3's decode
+        # chain, which is where the mixed fused launch has to live.
+        fuse_mixed_decode = (
+            fuse_decode_gate_norm
+            and attn_metadata.num_prefills > 0
+            and get_pcp_group().world_size == 1
+        )
+        # Spec decode (MTP on) and plain decode (MTP off) both get the gate and both
+        # q/k l2norms in one launch, so the decode preamble costs 1 Triton launch
+        # instead of 3 either way. Which branch fires is decided by the builder: it
+        # zeroes num_decodes as soon as num_spec_decodes > 0 (see its assert), so a
+        # given batch is either spec or non-spec, never both.
+        #
+        # Spec batches always fuse, pure or mixed. The gate stays full-batch - the
+        # spec slice is gathered by index_select below, not sliced - and that is fine
+        # here because the spec q/k already exist (spec conv1d ran in 1.1), so all
+        # three jobs are ready at this one point. The gather then slices the fused
+        # gate exactly as it sliced the unfused one.
+        fuse_spec = decode_gate_norm_fusion_enabled() and spec_sequence_masks is not None
+        # Set by the mixed-batch path so 2.2/2.3 know g/beta are prefill-only.
+        g_decode = None
+        beta_decode = None
+        if fuse_spec:
+            # a/b span num_actual_tokens, query_spec/key_spec span the spec tokens;
+            # the kernel sizes the gate (NUM_BATCHES) and the norms (M) independently,
+            # so the two extents do not have to agree. For a pure spec batch they do,
+            # because then every token is a spec token.
+            g, beta, query_spec, key_spec = gating_l2norm_qk(
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+                query_spec,
+                key_spec,
+            )
+        elif fuse_pure_decode:
+            # a/b already sliced to num_actual_tokens above; for a pure-decode batch
+            # that is exactly the decode rows, so the whole gate joins this launch.
+            g, beta, query_non_spec, key_non_spec = gating_l2norm_qk(
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+                query_non_spec,
+                key_non_spec,
+            )
+        elif fuse_mixed_decode:
+            # Prefill-only gate here; the decode slice leads the non-spec batch
+            # (the builder rebases prefill offsets by num_decode_tokens), so the
+            # prefill rows are the contiguous tail.
+            num_decode_tokens_gate = attn_metadata.num_decode_tokens
+            g_decode_src = a[:num_decode_tokens_gate]
+            b_decode_src = b[:num_decode_tokens_gate]
+            g, beta = DeviceOperator.fused_gdn_gating(
+                self.A_log,
+                a[num_decode_tokens_gate:],
+                b[num_decode_tokens_gate:],
+                self.dt_bias,
+            )
+        elif fuse_preamble:
             # Stale w.r.t. the split conv1d path: q/k below are prefill-only now,
             # while the y_q/y_k slicing further down still assumes they span the
             # whole batch. Re-enabling this for a mixed batch would double-slice.
@@ -841,8 +916,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
-            query_spec = l2norm_fwd(query_spec)
-            key_spec = l2norm_fwd(key_spec)
+            if not fuse_spec:
+                # Already normalized inside the fused gate+norm launch above when
+                # fuse_spec is on.
+                query_spec = l2norm_fwd(query_spec)
+                key_spec = l2norm_fwd(key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             # The custom op extends dtype support (e.g. float32 state) and is
@@ -874,8 +952,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # i.e. the PCP branch, which does not implement the split path.
             assert decode_conv_input is not None
             assert decode_conv_state_indices is not None
-            g_decode = g_non_spec[:, :num_decode_tokens]
-            beta_decode = beta_non_spec[:, :num_decode_tokens]
+            if not fuse_mixed_decode:
+                g_decode = g_non_spec[:, :num_decode_tokens]
+                beta_decode = beta_non_spec[:, :num_decode_tokens]
         core_attn_out_decode = None
 
         # 2.3: Process the remaining part
@@ -888,7 +967,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             assert g_non_spec is not None
             assert beta_non_spec is not None
-            if split_non_spec:
+            if split_non_spec and not fuse_mixed_decode:
                 # q/k/v already cover prefill rows only: the prefill conv1d kernel
                 # above was fed mixed_qkv_non_spec[num_decode_tokens:]. Gating still
                 # runs over the whole batch, so g/beta keep their slice.
@@ -991,8 +1070,28 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # non_spec_state_indices_tensor[num_decodes:] (builder) while decode
                 # uses [:num_decodes], so the order does not affect the result.
                 # The chunk op only normalizes the prefill slice.
-                query_decode = l2norm_fwd(query_decode)
-                key_decode = l2norm_fwd(key_decode)
+                if fuse_mixed_decode:
+                    # Decode gate + both l2norms in one launch, issued here because
+                    # the decode q/k only exist after the conv1d above. a/b were
+                    # sliced to the decode rows back at the gating site.
+                    (
+                        g_decode,
+                        beta_decode,
+                        query_decode,
+                        key_decode,
+                    ) = gating_l2norm_qk(
+                        self.A_log,
+                        g_decode_src,
+                        b_decode_src,
+                        self.dt_bias,
+                        query_decode,
+                        key_decode,
+                    )
+                else:
+                    query_decode = l2norm_fwd(query_decode)
+                    key_decode = l2norm_fwd(key_decode)
+                assert g_decode is not None
+                assert beta_decode is not None
                 core_attn_out_decode = npu_recurrent_gated_delta_rule(
                     query=query_decode.squeeze(0),
                     key=key_decode.squeeze(0),
@@ -1012,8 +1111,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         elif attn_metadata.num_decodes > 0:
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            query_non_spec = l2norm_fwd(query_non_spec)
-            key_non_spec = l2norm_fwd(key_non_spec)
+            if not fuse_pure_decode:
+                # Already normalized inside the fused gate+norm launch above.
+                query_non_spec = l2norm_fwd(query_non_spec)
+                key_non_spec = l2norm_fwd(key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = npu_recurrent_gated_delta_rule(

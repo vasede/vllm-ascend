@@ -467,3 +467,180 @@ def _gating_gather_clear_l2norm_qk_kernel(
         _l2norm_rows(XQ, YQ, eps, M, N, MBLOCK, NUM_CHUNKS, pid - N_GATHER - NUM_CORE)
     else:
         _l2norm_rows(XK, YK, eps, M, N, MBLOCK, NUM_CHUNKS, pid - N_GATHER - 2 * NUM_CORE)
+
+
+
+def decode_gate_norm_fusion_enabled() -> bool:
+    """Whether the GDN decode gate + both q/k l2norms may collapse into one launch.
+
+    ``VLLM_ASCEND_GDN_FUSE_DECODE_GATE_NORM=0`` restores the original three-launch
+    path (``fused_gdn_gating`` plus two ``l2norm_fwd`` calls).
+    """
+    return os.environ.get("VLLM_ASCEND_GDN_FUSE_DECODE_GATE_NORM", "1") == "1"
+
+
+def gating_l2norm_qk(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    eps: float = 1e-6,
+    gbeta: float = 1.0,
+    threshold: float = 20.0,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Decode gate (g/beta) plus both q/k l2norms in a single Triton launch.
+
+    Replaces ``DeviceOperator.fused_gdn_gating`` followed by two ``l2norm_fwd``
+    calls, i.e. three launches become one. Same motivation as
+    :func:`gating_gather_clear_l2norm_qk`: on this stack a Triton launch costs
+    ~300us of host time while these kernels run in under 20us, so the launch
+    count is what decides the cost of the decode preamble.
+
+    Bit-exactness: the three jobs keep the exact device-side bodies
+    (``_gdn_gating_rows``, ``_l2norm_rows``) and the same block/chunk geometry the
+    standalone kernels use, and they write disjoint tensors while reading none of
+    each other's output, so the result is identical to running them separately.
+    Gating is elementwise over tokens - only A_log/dt_bias are indexed by head and
+    there is no reduction across tokens - so handing it a token sub-range (the
+    decode slice of a mixed batch) is bit-identical to computing the full range
+    and slicing the result.
+
+    Returns ``(g, beta_output, q_norm, k_norm)``.
+    """
+    if a.dim() != 2:
+        raise ValueError(f"gating_l2norm_qk: expected 2D a [T, H], got {tuple(a.shape)}.")
+    batch, num_heads = a.shape
+    if not (a.is_contiguous() and b.is_contiguous() and a.shape == b.shape):
+        raise ValueError(
+            f"gating_l2norm_qk: a/b must be contiguous and same-shaped, got "
+            f"{tuple(a.shape)}/{tuple(b.shape)}. Set "
+            "VLLM_ASCEND_GDN_FUSE_DECODE_GATE_NORM=0 to use the unfused path."
+        )
+    if not (q.shape == k.shape and q.dtype == k.dtype):
+        raise ValueError(
+            f"gating_l2norm_qk: q/k must match, got {tuple(q.shape)}/{q.dtype} vs "
+            f"{tuple(k.shape)}/{k.dtype}. Set "
+            "VLLM_ASCEND_GDN_FUSE_DECODE_GATE_NORM=0 to use the unfused path."
+        )
+    if batch == 0:
+        raise ValueError("gating_l2norm_qk: empty batch; the caller should not reach here.")
+
+    # reshape also normalizes a non-contiguous input by copying, which the kernel's
+    # flat indexing (X + rindex + N * row_idx) relies on. Mirrors l2norm_fwd.
+    q_shape_og, k_shape_og = q.shape, k.shape
+    q2 = q.reshape(-1, q.shape[-1])
+    k2 = k.reshape(-1, k.shape[-1])
+    T, D = q2.shape[0], q2.shape[-1]
+    assert q2.stride(-1) == 1 and k2.stride(-1) == 1
+
+    max_fused_size = 65536 // q2.element_size()
+    if D > min(max_fused_size, triton.next_power_of_2(D)):
+        raise RuntimeError(f"gating_l2norm_qk: feature dim >= 64KB not supported, got {D}.")
+
+    y_q = torch.empty_like(q2)
+    y_k = torch.empty_like(k2)
+    # dtypes follow fused_gdn_gating_patch exactly: g is fp32, beta keeps b's dtype.
+    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+    beta_out = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+
+    num_core = get_vectorcore_num()
+    # Grid math copied from l2norm_fwd (mblock) and fused_gdn_gating_patch
+    # (blk_heads/blk_batches/row_iter) so each segment sees its original partition.
+    mblock = 69
+    num_sub_blocks = triton.cdiv(triton.cdiv(T, num_core), mblock)
+    blk_heads, blk_batches = 8, 64
+    row_iter = triton.cdiv(triton.cdiv(batch, num_core), blk_batches)
+
+    grid0 = 3 * num_core
+    ptrs = (g, beta_out, A_log, a, b, dt_bias, q2, y_q, k2, y_k)
+    constexprs = (D, mblock, num_core, blk_heads, blk_batches)
+    key = _prebound_key(ptrs, constexprs)
+    ck = _prebound_kernels.get(key)
+
+    if ck is None:
+        compiled = _gating_l2norm_qk_kernel[(grid0,)](
+            g, beta_out, A_log, a, b, dt_bias, num_heads, batch, gbeta, threshold,
+            row_iter, q2, y_q, k2, y_k, eps, T,
+            N=D, MBLOCK=mblock, NUM_CHUNKS=num_sub_blocks, NUM_CORE=num_core,
+            BLK_HEADS=blk_heads, BLK_BATCHES=blk_batches,
+        )
+        if (
+            os.environ.get("VLLM_ASCEND_GDN_PREBIND_LAUNCH", "1") == "1"
+            and compiled is not None
+            and hasattr(compiled, "run")
+            and hasattr(compiled, "packed_metadata")
+        ):
+            _prebound_kernels[key] = compiled
+        return g, beta_out, y_q.view(q_shape_og), y_k.view(k_shape_og)
+
+    # Pre-bound: mirrors the tail of JITFunction.run without its preamble. See the
+    # note above _prebound_kernels for why this is safe.
+    from triton.runtime import driver
+
+    stream = driver.active.get_current_stream(driver.active.get_current_device())
+    # Declaration order with constexprs removed, so NUM_CHUNKS lands last.
+    ck.run(
+        grid0, 1, 1, stream, ck.function, ck.packed_metadata, None, None, None,
+        g, beta_out, A_log, a, b, dt_bias, num_heads, batch, gbeta, threshold,
+        row_iter, q2, y_q, k2, y_k, eps, T, num_sub_blocks,
+    )
+
+    return g, beta_out, y_q.view(q_shape_og), y_k.view(k_shape_og)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "NUM_HEADS",
+        "NUM_BATCHES",
+        "gbeta",
+        "threshold",
+        "ROW_ITER",
+        "eps",
+        "M",
+        "NUM_CHUNKS",
+    ]
+)
+def _gating_l2norm_qk_kernel(
+    G,
+    BETA_OUT,
+    A_LOG,
+    A,
+    B,
+    DT_BIAS,
+    NUM_HEADS,
+    NUM_BATCHES,
+    gbeta,
+    threshold,
+    ROW_ITER,
+    XQ,
+    YQ,
+    XK,
+    YK,
+    eps,
+    M,
+    N: tl.constexpr,
+    MBLOCK: tl.constexpr,
+    NUM_CHUNKS,
+    NUM_CORE: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+    BLK_BATCHES: tl.constexpr,
+):
+    """gating + l2norm(q) + l2norm(k) in one launch.
+
+    Grid partition: ``NUM_CORE`` programs each for gating, q and k. The three jobs
+    write disjoint tensors (g/beta_out, y_q, y_k) and none reads another's output,
+    so their order inside the launch is free.
+    """
+    pid = tl.program_id(0)
+    if pid < NUM_CORE:
+        _gdn_gating_rows(
+            G, BETA_OUT, A_LOG, A, B, DT_BIAS, NUM_HEADS, NUM_BATCHES,
+            gbeta, threshold, BLK_HEADS, BLK_BATCHES, ROW_ITER, pid,
+        )
+    elif pid < 2 * NUM_CORE:
+        _l2norm_rows(XQ, YQ, eps, M, N, MBLOCK, NUM_CHUNKS, pid - NUM_CORE)
+    else:
+        _l2norm_rows(XK, YK, eps, M, N, MBLOCK, NUM_CHUNKS, pid - 2 * NUM_CORE)
+
