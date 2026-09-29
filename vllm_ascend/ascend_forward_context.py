@@ -21,6 +21,7 @@ from vllm_ascend.utils import (
     has_layer_idx,
     is_drafter_moe_model,
     is_moe_model,
+    matmul_reduce_scatter_enable,
     speculative_enable_dispatch_gmm_combine_decode,
 )
 
@@ -126,7 +127,14 @@ def set_ascend_forward_context(
         is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
         if is_context_moe_model:
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
-            mmrs_fusion = False
+            # PR #3834 hard-disabled the fusion for MoE: MoE's SP is always-on and
+            # (unlike the dense branch below) had no num_tokens>1000 gate, so
+            # MatmulReduceScatter fell onto small decode shapes where it degrades.
+            # matmul_and_reduce now carries its own explicit shape[0]>1000 gate, so
+            # defer to the feature key instead of a blanket disable. The key defaults
+            # to False, so every default path keeps #3834's behaviour; A5 re-checks
+            # the key again in linear_op.SequenceRowParallelOp.matmul_and_reduce.
+            mmrs_fusion = mmrs_fusion and matmul_reduce_scatter_enable()
         elif is_draft_model:
             # TODO: for dense drafter, `sp` is redundant and is not compatible with `dp` and `graph`.
             # Disable it to avoid more problems.
