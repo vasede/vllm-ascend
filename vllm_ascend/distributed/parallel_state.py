@@ -1,6 +1,7 @@
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
+from vllm.logger import init_logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import (
@@ -22,6 +23,8 @@ _EMBED_TP: GroupCoordinator | None = None
 # flashcomm specific groups
 _FLASHCOMM2_OTP: GroupCoordinator | None = None
 _FLASHCOMM2_ODP: GroupCoordinator | None = None
+logger = init_logger(__name__)
+
 _FC3_QUANT_X: GroupCoordinator | None = None
 
 # shard_weight across rank groups
@@ -36,6 +39,13 @@ _CCU_SCHED: GroupCoordinator | None = None
 
 # Dedicated TP domain for A5 prefill MatmulAllReduce (AICPU).
 _MATMUL_ALLREDUCE: GroupCoordinator | None = None
+
+# Dedicated TP domain for A5 prefill AllGatherMatmul (AICPU MC2).
+# Must NOT be shared with ccu_sched: when AllGather MC2 and the ordinary
+# collectives / MatmulReduceScatter land on one communicator, the MC2 AICPU
+# kernel can block forever in HcommThreadNotifyWaitOnThread (ret=15) while an
+# ordinary ReduceScatter is still in flight on the same group -> 507018.
+_ALLGATHER_MATMUL: GroupCoordinator | None = None
 
 
 def init_ascend_model_parallel(
@@ -120,6 +130,12 @@ def init_ascend_model_parallel(
 
     if get_ascend_device_type() == AscendDeviceType.A5 and global_tp_size > 1:
         global _CCU_SCHED
+        # Initialize ordinary HCCL resources before any AICPU MC2 domain is
+        # built. Mirrors the MatmulAllReduce path: even separate domains can
+        # fail with 507018 if MC2 initializes process resources first.
+        ccu_warmup = torch.zeros(1, device=get_tp_group().device)
+        torch.distributed.all_reduce(ccu_warmup, group=get_tp_group().device_group)
+        torch.npu.synchronize()
         ccu_sched_group_ranks = [x.tolist() for x in all_ranks.view(-1, global_tp_size)]
         _CCU_SCHED = init_model_parallel_group(
             ccu_sched_group_ranks, get_world_group().local_rank, backend, group_name="ccu_sched"
@@ -145,6 +161,42 @@ def init_ascend_model_parallel(
             backend,
             group_name="matmul_allreduce_mc2",
         )
+    
+    if (
+        get_ascend_device_type() == AscendDeviceType.A5
+        and global_tp_size > 1
+        and get_ascend_config().enable_matmul_all_gather
+    ):
+        global _ALLGATHER_MATMUL
+        # Separate communicator for the AllGather MC2 half. Sharing ccu_sched
+        # with MatmulReduceScatter and the flashcomm1 ReduceScatter deadlocks
+        # the AICPU kernel (HcommThreadNotifyWaitOnThread ret=15 -> 507018).
+        _ALLGATHER_MATMUL = init_model_parallel_group(
+            [x.tolist() for x in all_ranks.view(-1, global_tp_size)],
+            get_world_group().local_rank,
+            backend,
+            group_name="allgather_matmul_mc2",
+        )
+
+    # Map vllm-ascend domain names onto the HCCL comm names that show up in
+    # plog ("group_name_N"), so an MC2 task exception can be attributed to a
+    # domain without guessing the creation order.
+    if get_ascend_device_type() == AscendDeviceType.A5 and global_tp_size > 1:
+        try:
+            _npu_dev = torch.device("npu")
+            for _label, _grp in (
+                ("tp", get_tp_group()),
+                ("ccu_sched", _CCU_SCHED),
+                ("matmul_allreduce_mc2", _MATMUL_ALLREDUCE),
+                ("allgather_matmul_mc2", _ALLGATHER_MATMUL),
+            ):
+                if _grp is None:
+                    continue
+                _name = _grp.device_group._get_backend(_npu_dev).get_hccl_comm_name(_grp.rank_in_group)
+                logger.info("MC2 domain map: %s -> hccl comm %s", _label, _name)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("MC2 domain map unavailable: %s", _exc)
+
 
     # Initialize fine-grained TP process groups on Ascend for four components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
@@ -333,11 +385,21 @@ def get_matmul_allreduce_group() -> GroupCoordinator:
     return _MATMUL_ALLREDUCE
 
 
+def get_allgather_matmul_group() -> GroupCoordinator:
+    assert _ALLGATHER_MATMUL is not None, "AllGatherMatmul group is not initialized"
+    return _ALLGATHER_MATMUL
+
+
 def destroy_ascend_model_parallel():
     global _MATMUL_ALLREDUCE
     if _MATMUL_ALLREDUCE is not None:
         _MATMUL_ALLREDUCE.destroy()
     _MATMUL_ALLREDUCE = None
+
+    global _ALLGATHER_MATMUL
+    if _ALLGATHER_MATMUL is not None:
+        _ALLGATHER_MATMUL.destroy()
+    _ALLGATHER_MATMUL = None
 
     global _MC2
     if _MC2:

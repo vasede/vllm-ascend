@@ -18,7 +18,10 @@ from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
-from vllm_ascend.distributed.parallel_state import get_ccu_sched_group
+from vllm_ascend.distributed.parallel_state import (
+    get_allgather_matmul_group,
+    get_ccu_sched_group,
+)
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -349,8 +352,13 @@ def _all_gather_matmul_prequant_mxfp8_impl(
 
     t_full = quantized_x.shape[0] * world_size
     if flash and label and t_full > 1000:
-        hcom = get_ccu_sched_group().device_group._get_backend(torch.device("npu")).get_hccl_comm_name(
-            get_tensor_model_parallel_rank()
+        # Dedicated AllGather MC2 domain: sharing ccu_sched with
+        # MatmulReduceScatter / the flashcomm1 ReduceScatter deadlocks the
+        # AICPU kernel (HcommThreadNotifyWaitOnThread ret=15 -> 507018).
+        hcom = (
+            get_allgather_matmul_group()
+            .device_group._get_backend(torch.device("npu"))
+            .get_hccl_comm_name(get_tensor_model_parallel_rank())
         )
         o = torch_npu.npu_all_gather_quant_mm(
             quantized_x, x2_v, hcom, world_size,
