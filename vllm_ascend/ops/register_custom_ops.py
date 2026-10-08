@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -11,6 +13,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -360,11 +363,31 @@ def _all_gather_matmul_prequant_mxfp8_impl(
             .device_group._get_backend(torch.device("npu"))
             .get_hccl_comm_name(get_tensor_model_parallel_rank())
         )
-        o = torch_npu.npu_all_gather_quant_mm(
-            quantized_x, x2_v, hcom, world_size,
+        # comm_mode is sweepable without a rebuild: AllGatherMatmulV2 hangs in
+        # HcommThreadNotifyWaitOnThread (ret=15 -> 507018) even on a dedicated
+        # domain, so the working value is not yet known. "" omits the kwarg.
+        ag_comm_mode = os.environ.get("VLLM_ASCEND_AG_MC2_COMM_MODE", "ai_cpu")
+        ag_kwargs = dict(
             x1_scale=pertoken_scale, x2_scale=ws_v, group_sizes=[1, 1, group_size],
             x1_scale_dtype=e8m0, x2_scale_dtype=e8m0, gather_index=0,
-            y_dtype=283, comm_mode="ai_cpu",
+            y_dtype=283,
+        )
+        if ag_comm_mode:
+            ag_kwargs["comm_mode"] = ag_comm_mode
+        # Ties the failing plog algTag/group back to this call site: plog only
+        # reports the HCCL name ("group_name_N"), never the vllm-ascend domain.
+        if not getattr(_all_gather_matmul_prequant_mxfp8_impl, "_logged", False):
+            _all_gather_matmul_prequant_mxfp8_impl._logged = True
+            logger.info(
+                "AG MC2: hcom=%s comm_mode=%r world_size=%d t_loc=%d t_full=%d "
+                "x1=%s/%s x1_scale=%s x2=%s/%s x2_scale=%s group_size=%d",
+                hcom, ag_comm_mode, world_size, quantized_x.shape[0], t_full,
+                tuple(quantized_x.shape), quantized_x.dtype,
+                tuple(pertoken_scale.shape), tuple(x2_v.shape), x2_v.dtype,
+                tuple(ws_v.shape), group_size,
+            )
+        o = torch_npu.npu_all_gather_quant_mm(
+            quantized_x, x2_v, hcom, world_size, **ag_kwargs
         )
         out = o[0] if isinstance(o, (tuple, list)) else o
         pad = _EXTRA_CTX.pad_size

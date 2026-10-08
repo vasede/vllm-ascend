@@ -1,7 +1,7 @@
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
-from vllm.logger import init_logger
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import (
@@ -23,7 +23,6 @@ _EMBED_TP: GroupCoordinator | None = None
 # flashcomm specific groups
 _FLASHCOMM2_OTP: GroupCoordinator | None = None
 _FLASHCOMM2_ODP: GroupCoordinator | None = None
-logger = init_logger(__name__)
 
 _FC3_QUANT_X: GroupCoordinator | None = None
 
