@@ -312,6 +312,19 @@ direct_register_custom_op(
 )
 
 _AGMM_PQ_CACHE: dict = {}
+_AGMM_PQ_COMM_WARMED_UP = False
+
+
+def _warmup_all_gather_matmul_comm(group, device: torch.device) -> None:
+    """Initialize and synchronize the communicator before the first AICPU MC2 op."""
+    global _AGMM_PQ_COMM_WARMED_UP
+    if _AGMM_PQ_COMM_WARMED_UP:
+        return
+
+    warmup = torch.zeros(1, device=device)
+    torch.distributed.all_reduce(warmup, group=group.device_group)
+    torch.npu.synchronize()
+    _AGMM_PQ_COMM_WARMED_UP = True
 
 
 def _all_gather_matmul_prequant_mxfp8_impl(
@@ -349,7 +362,9 @@ def _all_gather_matmul_prequant_mxfp8_impl(
 
     t_full = quantized_x.shape[0] * world_size
     if flash and label and t_full > 1000:
-        hcom = get_ccu_sched_group().device_group._get_backend(torch.device("npu")).get_hccl_comm_name(
+        group = get_ccu_sched_group()
+        _warmup_all_gather_matmul_comm(group, quantized_x.device)
+        hcom = group.device_group._get_backend(torch.device("npu")).get_hccl_comm_name(
             get_tensor_model_parallel_rank()
         )
         o = torch_npu.npu_all_gather_quant_mm(
