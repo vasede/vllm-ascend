@@ -35,6 +35,7 @@ from vllm_ascend.device.mxfp_compat import (
 from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.utils import maybe_trans_nz_with_scale
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -340,8 +341,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         """Process weights after loading for MXFP8 inference.
 
         This method transforms weights for NPU MXFP8 computation:
-        - w13_weight: (g_num, n_size, k_size) -> (g_num, k_size, n_size)
-        - w2_weight: (g_num, n_size, k_size) -> (g_num, k_size, n_size)
+        - w13_weight: (g_num, n_size, k_size) -> (g_num, k_size, n_size) in FRACTAL_NZ
+        - w2_weight: (g_num, n_size, k_size) -> (g_num, k_size, n_size) in FRACTAL_NZ
         - w13_weight_scale: (g_num, n_size, k_size) -> (g_num, k_size//2, n_size, 2)
         - w2_weight_scale: (g_num, n_size, k_size) -> (g_num, k_size//2, n_size, 2)
 
@@ -373,6 +374,28 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
+        
+        if not hasattr(layer, "_mxfp8_moe_buffers"):
+            layer._mxfp8_moe_buffers = {}
+        for weight_name in ("w13_weight", "w2_weight"):
+            weight = getattr(layer, weight_name)
+            scale = getattr(layer, f"{weight_name}_scale")
+            g_num, n_size, k_size = scale.shape
+            target_scale = scale.data.reshape(g_num, n_size, k_size // 2, 2)
+            if weight_name not in layer._mxfp8_moe_buffers:
+                layer._mxfp8_moe_buffers[weight_name] = maybe_trans_nz_with_scale(
+                    weight.data,
+                    target_scale,
+                    transpose_dims=(1, 2),
+                    customize_dtype=torch.float8_e4m3fn,
+                )
+            else:
+                # ACL graphs retain both weight and scale addresses across RL reloads.
+                # Materialize sources before copying because restored views can alias.
+                weight_buffer, scale_buffer = layer._mxfp8_moe_buffers[weight_name]
+                weight_buffer.copy_(weight.data.transpose(1, 2).contiguous())
+                scale_buffer.copy_(target_scale.transpose(1, 2).contiguous())
+            weight.data, scale.data = layer._mxfp8_moe_buffers[weight_name]
 
         # Mark as transformed
         layer._mxfp8_transformed = True
@@ -422,7 +445,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             orig_scale_shape = orig_shapes[scale_key]
 
             target_scale = scale_tensor.data.transpose(1, 2).reshape(orig_scale_shape).contiguous()
-            scale_tensor.data = scale_tensor.data.transpose(1, 2).view(orig_scale_shape)
+            scale_tensor.data = scale_tensor.data.transpose(1, 2).reshape(orig_scale_shape)
             scale_tensor.data.copy_(target_scale)
 
         _restore("w13_weight", "w13_weight_scale")
