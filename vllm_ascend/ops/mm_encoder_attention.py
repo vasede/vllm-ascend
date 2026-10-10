@@ -25,10 +25,12 @@ matching the LLM full-graph pattern in :mod:`vllm_ascend.attention.attention_v1`
 from __future__ import annotations
 
 import einops
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.encoder_acl_graph import (
@@ -42,9 +44,32 @@ MIN_PAD_SIZE: int = 64
 MAX_PAD_SIZE: int = 128
 SWA_INT_MAX: int = 2147483647
 FIA_BLOCK_SIZE: int = 128
+ACTUAL_SEQ_LENGTHS_ATTR: str = "_vllm_ascend_actual_seq_lengths"
 
 
 class AscendMMEncoderAttention(MMEncoderAttention):
+    @classmethod
+    def maybe_recompute_cu_seqlens(
+        cls,
+        attn_backend: AttentionBackendEnum,
+        cu_seqlens: np.ndarray,
+        hidden_size: int,
+        tp_size: int,
+        device: torch.device,
+        fp8_padded_hidden_size: int | None = None,
+    ) -> torch.Tensor:
+        actual_seq_lengths = cu_seqlens[1:].tolist()
+        device_cu_seqlens = super().maybe_recompute_cu_seqlens(
+            attn_backend,
+            cu_seqlens,
+            hidden_size,
+            tp_size,
+            device,
+            fp8_padded_hidden_size=fp8_padded_hidden_size,
+        )
+        setattr(device_cu_seqlens, ACTUAL_SEQ_LENGTHS_ATTR, actual_seq_lengths)
+        return device_cu_seqlens
+
     def __init__(
         self,
         num_heads: int,
@@ -119,13 +144,17 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         cu_seqlens: torch.Tensor | None,
         *,
         is_capturing: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[int]:
         # If cu_seqlens is not provided, we create a default one assuming all sequences have the same length.
         # This is used by models such as Hunyuan-OCR, which always pass None as cu_seqlens and rely on the operator to
         # compute it internally.
         if is_capturing or cu_seqlens is None:
             cu_seqlens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device="cpu")
             return cu_seqlens
+        
+        actual_seq_lengths = getattr(cu_seqlens, ACTUAL_SEQ_LENGTHS_ATTR, None)
+        if actual_seq_lengths is not None:
+            return actual_seq_lengths
 
         return cu_seqlens.cpu()
 

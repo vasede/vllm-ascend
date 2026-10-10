@@ -133,7 +133,7 @@ def set_encoder_forward_context(
 
 
 def maybe_compute_actual_seq_lengths(
-    cu_seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor | list[int],
     num_query_tokens: int,
     num_kv_tokens: int,
     *,
@@ -141,12 +141,16 @@ def maybe_compute_actual_seq_lengths(
 ) -> tuple[list[int], list[int]]:
     """Convert ``cu_seqlens`` to FIA host ``actual_seq_lengths``.
 
-    Drops the leading-zero marker; with ``cudagraph_mm_encoder`` filters endpoints and
-    aligns the terminal to ``num_query_tokens``; when Q≠KV, scales Q endpoints by
-    ``num_kv_tokens // num_query_tokens`` for the KV list.
+    Tensor inputs include a leading-zero marker, while list inputs are already
+    cumulative endpoints. With ``cudagraph_mm_encoder``, filters endpoints and
+    aligns the terminal to ``num_query_tokens``; when Q!=KV, scales Q endpoints
+    by ``num_kv_tokens // num_query_tokens`` for the KV list.
     """
-    flat = cu_seqlens.detach().cpu().view(-1).tolist()
-    actual = flat[1:] if flat else flat
+    if isinstance(cu_seqlens, torch.Tensor):
+        flat = cu_seqlens.detach().cpu().view(-1).tolist()
+        actual = flat[1:] if flat else flat
+    else:
+        actual = list(cu_seqlens)
 
     if not cudagraph_mm_encoder:
         pass
