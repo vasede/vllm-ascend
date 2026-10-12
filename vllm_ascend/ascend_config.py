@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import importlib.util
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -951,3 +952,91 @@ def get_ascend_config():
     if _ASCEND_CONFIG is None or not _is_ascend_config_initialized(_ASCEND_CONFIG):
         raise RuntimeError("Ascend config is not initialized. Please call init_ascend_config first.")
     return _ASCEND_CONFIG
+
+
+_MEGA_MOE_SUPPORTED: bool | None = None
+
+
+def is_mega_moe_supported() -> bool:
+    """Whether the CANN MegaMoe op package is importable at runtime.
+
+    MegaMoe is delivered by the CANN ops-transformer component as the python
+    package ``cann_ops_transformer`` (shipped under
+    ``$ASCEND_TOOLKIT_HOME/python/site-packages``), not via torch_npu. Always
+    read the cached flag through this accessor so callers cannot bind a stale
+    snapshot of the module-level bool.
+    """
+    global _MEGA_MOE_SUPPORTED
+    if _MEGA_MOE_SUPPORTED is None:
+        _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
+    return _MEGA_MOE_SUPPORTED
+
+
+# Discrete value sets accepted by the Ascend 950 MegaMoe op. Source of truth is
+# the CANN-shipped doc
+# $ASCEND_TOOLKIT_HOME/python/site-packages/cann_ops_transformer/docs/zh/mega_moe.md
+# ("Ascend 950PR/Ascend 950DT" constraints section, verified against CANN
+# 9.2.0-beta.2).
+_A5_MEGA_MOE_HIDDEN_SIZES = frozenset({1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192})
+_A5_MEGA_MOE_INTERMEDIATE_HIDDEN_SIZES = frozenset({1024, 2048, 3072, 4096, 7168})
+_A5_MEGA_MOE_MAX_TOPK = 32
+
+
+def is_a5_megamoe_supported_by_config(vllm_config: "VllmConfig") -> bool:
+    """Validate the model/parallel shape against the A5 MegaMoe constraints.
+
+    A5 MegaMoe only implements the MXFP scenarios (dispatch_quant_mode == 4)
+    and constrains hidden / intermediate_hidden to fixed discrete sets.
+    """
+    hf_text_config = vllm_config.model_config.hf_text_config
+    hidden_size = getattr(hf_text_config, "hidden_size", None)
+    if hidden_size is None and hasattr(vllm_config.model_config, "get_hidden_size"):
+        hidden_size = vllm_config.model_config.get_hidden_size()
+    if hidden_size is None:
+        return False
+    if int(hidden_size) not in _A5_MEGA_MOE_HIDDEN_SIZES:
+        logger.warning(
+            "mega moe is not supported by current a5 config: hidden_size %s not in %s",
+            int(hidden_size),
+            sorted(_A5_MEGA_MOE_HIDDEN_SIZES),
+        )
+        return False
+
+    moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+    if moe_intermediate_size is None:
+        return False
+    # intermediate_hidden == l1_weights.dim1 == 2 * moe_intermediate_size.
+    intermediate_hidden = 2 * int(moe_intermediate_size)
+    if intermediate_hidden not in _A5_MEGA_MOE_INTERMEDIATE_HIDDEN_SIZES:
+        logger.warning(
+            "mega moe is not supported by current a5 config: intermediate_hidden %s not in %s",
+            intermediate_hidden,
+            sorted(_A5_MEGA_MOE_INTERMEDIATE_HIDDEN_SIZES),
+        )
+        return False
+
+    # num_experts must divide evenly across the EP group (doc: num_experts %
+    # ep_world_size == 0, ep_world_size in [2, 1024]).
+    ep_world_size = (
+        vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+    )
+    if ep_world_size < 2:
+        return False
+    if int(vllm_config.model_config.get_num_experts()) % ep_world_size != 0:
+        logger.warning(
+            "mega moe is not supported by current a5 config: num_experts %s is not divisible by ep_world_size %s",
+            vllm_config.model_config.get_num_experts(),
+            ep_world_size,
+        )
+        return False
+
+    num_top_k = getattr(hf_text_config, "num_experts_per_tok", getattr(hf_text_config, "top_k_experts", 1))
+    if not (1 <= int(num_top_k) <= _A5_MEGA_MOE_MAX_TOPK):
+        logger.warning(
+            "mega moe is not supported by current a5 config: num_top_k %s is not in [1, %d]",
+            num_top_k,
+            _A5_MEGA_MOE_MAX_TOPK,
+        )
+        return False
+    return True
+

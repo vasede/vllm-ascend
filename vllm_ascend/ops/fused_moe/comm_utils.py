@@ -15,10 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from importlib import import_module
+
 import torch
 import torch.distributed
 import torch.distributed as dist
 import torch_npu
+from vllm.logger import logger
+
+from vllm_ascend.quantization.quant_type import QuantType
 
 COMM_STREAM = None
 
@@ -102,3 +107,73 @@ def gather_from_sequence_parallel_region(
 ):
     """Wrapper for autograd function: forward: AG, backward: RS <first dim>"""
     return _gather_along_first_dim(input_, group, output_split_sizes)
+
+
+
+
+# ---------------------------------------------------------------------------
+# CANN MegaMoe (mc2/mega_moe) integration helpers.
+#
+# MegaMoe fuses dispatch + grouped-matmul + swiglu + combine into one op. It is
+# delivered by the CANN ops-transformer component, whose python entry points
+# live in the ``cann_ops_transformer.ops`` module (NOT torch_npu). The constants
+# below are the ACL dtype / quant-mode enums the op expects; the authoritative
+# reference is the CANN-shipped
+# $ASCEND_TOOLKIT_HOME/python/site-packages/cann_ops_transformer/docs/zh/mega_moe.md
+# ---------------------------------------------------------------------------
+_CANN_ACL_INT8 = 258
+_CANN_ACL_INT4 = 285
+# 23 = FLOAT8_E5M2, 24 = FLOAT8_E4M3FN, 296 = FLOAT4_E2M1.
+_CANN_ACL_FLOAT8_E5M2 = 23
+_CANN_ACL_FLOAT8_E4M3FN = 24
+_CANN_ACL_FLOAT4_E2M1 = 296
+
+_CANN_MEGA_MOE_QUANT_MODE_NONE = 0
+_CANN_MEGA_MOE_QUANT_MODE_INT8 = 2
+_CANN_MEGA_MOE_QUANT_MODE_MXFP = 4
+
+# QuantType -> (dispatch_quant_mode, dispatch_quant_out_dtype, weight_type).
+#
+# A5 (Ascend 950PR/DT) is MXFP-only: the doc states A16W16 / A8W8-INT /
+# A8W4-INT are NOT supported, and dispatch_quant_mode must be 4. The
+# dispatch_quant_out_dtype binds to the ACTIVATION dtype and weight_type to the
+# WEIGHT dtype, per the A5 scenario table:
+#   MXFP8    -> A8W8-FP (act FP8, weight FP8)
+#   W4A8MXFP -> A8W4-FP (act FP8, weight FP4)
+#   MXFP4    -> A4W4-FP (act FP4, weight FP4)
+# NOTE: this tree's QuantType names differ from vllm-ascend main (MXFP8 here ==
+# W8A8MXFP upstream, MXFP4 here == W4A4MXFP upstream).
+#
+# The INT8/INT4 rows are the A2/A3 scenarios, kept for completeness; the ACL
+# enum ints (258 / 285) are passed rather than torch dtypes because the op
+# derives W4A8's packed N from the int8 storage shape.
+_CANN_MEGA_MOE_QUANT_SETTINGS: dict[QuantType, tuple[int, int | None, int | None]] = {
+    QuantType.NONE: (_CANN_MEGA_MOE_QUANT_MODE_NONE, None, None),
+    QuantType.W8A8: (_CANN_MEGA_MOE_QUANT_MODE_INT8, _CANN_ACL_INT8, _CANN_ACL_INT8),
+    QuantType.W4A8: (_CANN_MEGA_MOE_QUANT_MODE_INT8, _CANN_ACL_INT8, _CANN_ACL_INT4),
+    QuantType.MXFP8: (_CANN_MEGA_MOE_QUANT_MODE_MXFP, _CANN_ACL_FLOAT8_E4M3FN, _CANN_ACL_FLOAT8_E4M3FN),
+    QuantType.W4A8MXFP: (_CANN_MEGA_MOE_QUANT_MODE_MXFP, _CANN_ACL_FLOAT8_E4M3FN, _CANN_ACL_FLOAT4_E2M1),
+    QuantType.MXFP4: (_CANN_MEGA_MOE_QUANT_MODE_MXFP, _CANN_ACL_FLOAT4_E2M1, _CANN_ACL_FLOAT4_E2M1),
+}
+
+
+def load_cann_mega_moe_ops():
+    """Return (get_symm_buffer_for_mega_moe, mega_moe) from the CANN package."""
+    ops_module = import_module("cann_ops_transformer.ops")
+    return ops_module.get_symm_buffer_for_mega_moe, ops_module.mega_moe
+
+
+def get_cann_mega_moe_quant_settings(quant_type: QuantType) -> tuple[int, int | None, int | None]:
+    """Returns (dispatch_quant_mode, dispatch_quant_out_dtype, weight_type)."""
+    if quant_type not in _CANN_MEGA_MOE_QUANT_SETTINGS:
+        raise RuntimeError(
+            "MegaMoe integration supports W8A8/W4A8 INT on A2/A3 and MXFP8/W4A8MXFP/MXFP4 on A5. "
+            f"Unsupported quant type: {quant_type}."
+        )
+    settings = _CANN_MEGA_MOE_QUANT_SETTINGS[quant_type]
+    logger.debug(
+        "cann mega_moe quant settings: dispatch_quant_mode=%s dispatch_quant_out_dtype=%s weight_type=%s",
+        *settings,
+    )
+    return settings
+

@@ -35,3 +35,19 @@ class QuantType(Enum):
     W4A8MXFP = 6
     W8A8FP8 = 7
     W4A16MXFP4 = 8
+
+
+
+# Quant types whose weight layouts the A5 MegaMoe (FUSED_MC2) operator supports.
+# NOTE: the names here differ from the vllm-ascend main branch (which calls these
+# W8A8MXFP / W4A4MXFP); this tree uses MXFP8 / MXFP4 for the same scenarios:
+#   MXFP8     -> A8W8-FP (act FP8, weight FP8)
+#   W4A8MXFP  -> A8W4-FP (act FP8, weight FP4)
+#   MXFP4     -> A4W4-FP (act FP4, weight FP4)
+A5_SUPPORT_MEGA_MOE_QUANT_TYPES = frozenset(
+    {
+        QuantType.MXFP8,
+        QuantType.W4A8MXFP,
+        QuantType.MXFP4,
+    }
+)

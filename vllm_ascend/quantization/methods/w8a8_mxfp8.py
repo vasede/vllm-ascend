@@ -26,7 +26,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
     ensure_mxfp8_linear_available,
@@ -310,13 +310,21 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             topk_weights = topk_weights.to(x.dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
+        # Both paths read the same tensors here: process_weights_after_loading
+        # leaves them in the native (E, out, in) layout for MegaMoe, and
+        # transposes + NZ-casts them in place for npu_grouped_matmul.
+        w1 = layer.w13_weight
+        w2 = layer.w2_weight
+        w1_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
+                w1=w1,
+                w2=w2,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -331,8 +339,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 mxfp_per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
                 swiglu_limit=layer.swiglu_limit,
             )
         )
@@ -365,6 +373,31 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 "w2_weight": tuple(layer.w2_weight.data.shape),
                 "w2_weight_scale": tuple(layer.w2_weight_scale.data.shape),
             }
+
+        if use_cann_megamoe(get_current_vllm_config()):
+            # MegaMoe (A8W8-FP scenario) consumes the weights in their ORIGINAL
+            # (out, in) layout as a per-expert python list, plus reshaped --
+            # explicitly NOT transposed -- E8M0 scales. Per the CANN doc:
+            #   l1_weights    (local_experts, intermediate_hidden, hidden)
+            #   l2_weights    (local_experts, hidden, intermediate_hidden / 2)
+            #   l1_weights_sf (local_experts, intermediate_hidden, CeilDiv(hidden, 64), 2)
+            #   l2_weights_sf (local_experts, hidden, CeilDiv(intermediate_hidden / 2, 64), 2)
+            # which is exactly vllm's native w13/w2 layout, so no transpose and
+            # no FRACTAL_NZ cast here (contrast with the npu_grouped_matmul path
+            # below, which needs both).
+            for weight_name in ("w13_weight", "w2_weight"):
+                scale = getattr(layer, f"{weight_name}_scale")
+                g_num, n_size, k_size = scale.shape
+                scale.data = scale.data.reshape(g_num, n_size, k_size // 2, 2)
+
+            # A5 MXFP MegaMoe takes the stacked tensor as a ONE-element list
+            # (doc: list length is num_experts_per_rank only for the
+            # bfloat16/int8/int4 scenarios; for float8_e4m3fn weights and
+            # float8_e8m0 scales it must be 1). So keep w13/w2 as-is and let
+            # apply() wrap them -- do NOT unbind per expert, and do not
+            # dispose the stacked tensors.
+            layer._mxfp8_transformed = True
+            return
 
         if not hasattr(layer, "_mxfp8_moe_buffers"):
             layer._mxfp8_moe_buffers = {}

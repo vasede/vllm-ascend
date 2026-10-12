@@ -29,7 +29,7 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
+from vllm_ascend.ascend_forward_context import get_mega_moe_tokens_per_rank, get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
@@ -125,6 +125,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         num_tokens_per_tp_rank = mc2_tokens_capacity // tp_size
         _max_global_bs = num_tokens_per_tp_rank * self.ep_world_size
+
+        # Rank-invariant per-rank token cap, derived from compile-time scheduler
+        # / graph config only. MegaMoe's symmetric buffer handshake is a
+        # collective over the EP group, so every rank MUST compute an identical
+        # shape here -- deriving it from the current forward's token count makes
+        # ranks allocate mismatched buffers and HCCL aborts (507057).
+        # MegaMoe's symm buffer is sized from the scheduler budget, not from
+        # mc2_tokens_capacity (which only covers the MC2 HCCL comm buffer).
+        self.max_num_tokens_per_rank = get_mega_moe_tokens_per_rank(vllm_config)
 
         # When allreduce across DP is not skipped, tokens are uniform across ranks:
         # use global_bs=0 (uniform mode) and pass mc2_mask.

@@ -11,7 +11,8 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import get_ascend_config, is_a5_megamoe_supported_by_config, is_mega_moe_supported
+from vllm_ascend.quantization.quant_type import A5_SUPPORT_MEGA_MOE_QUANT_TYPES, QuantType
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -101,6 +102,8 @@ def set_ascend_forward_context(
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
+        forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
@@ -214,10 +217,23 @@ _mc2_tokens_capacity: int | None = None
 _reserved_mc2_mask: torch.Tensor | None = None
 
 
+# Per-rank token caps. Regular MC2 lives in the HCCL comm buffer
+# (HCCL_BUFFSIZE), so it is kept small to save memory. MegaMoe instead uses its
+# own symmetric buffer (a separate torch allocation), and on A5 it also serves
+# PREFILL, so it needs the full per-rank prefill token count.
+_MC2_TOKENS_PER_RANK_LIMIT = 512
+_MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
+
 def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len):
     global _mc2_tokens_capacity
     if _mc2_tokens_capacity is not None:
         return
+    # NOTE: mc2_tokens_capacity sizes the HCCL comm buffer for the MC2 dispatch
+    # / combine ops ONLY. MegaMoe does not read it -- it sizes its own symmetric
+    # buffer from get_mega_moe_tokens_per_rank() below. Keep the two apart:
+    # raising this for MegaMoe's sake breaks any layer that still falls back to
+    # MC2 (e.g. an unquantized MTP draft MoE), which then dies with
+    # aclnnMoeDistributeDispatchV4 error 561002.
     if get_ascend_config().enable_prefill_mc2:
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     elif vllm_config.compilation_config.cudagraph_capture_sizes:
@@ -227,9 +243,29 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     # Use integer arithmetic for ceiling division.
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
-    # NOTE: To save memory, we cap the max number of tokens to 512.
-    num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
+    # NOTE: To save memory, we cap the max number of tokens per rank.
+    num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MC2_TOKENS_PER_RANK_LIMIT)
     _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+    logger.info(
+        "mc2_tokens_capacity=%d (max_num_tokens=%d, tp_size=%d)",
+        _mc2_tokens_capacity,
+        max_num_tokens,
+        tp_size,
+    )
+
+
+def get_mega_moe_tokens_per_rank(vllm_config) -> int:
+    """Rank-invariant per-rank token budget for MegaMoe's symmetric buffer.
+
+    On A5 the fused op also serves prefill, so this follows the scheduler token
+    budget rather than the decode graph sizes. It MUST be identical on every EP
+    rank (the symm-buffer handshake is a collective), so it is derived only from
+    compile-time config -- never from the live token count.
+    """
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    per_rank = (max_num_tokens + tp_size - 1) // tp_size
+    return max(1, min(per_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT))
 
 
 def get_mc2_tokens_capacity():
@@ -250,6 +286,44 @@ def set_mc2_mask(vllm_config, device):
 
 def get_mc2_mask():
     return _reserved_mc2_mask
+
+
+def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
+    """True on a disaggregated-prefill D node (kv consumer, not producer).
+
+    MegaMoe sizes its symmetric receive buffer from this: a pure D node can use
+    the absolute safe upper bound (decode token counts are small and bounded),
+    while P / PD-mixed nodes keep the configured mega_moe_max_tokens tradeoff.
+    """
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_config is None:
+        return False
+    return bool(getattr(kv_config, "is_kv_consumer", False)) and not bool(
+        getattr(kv_config, "is_kv_producer", False)
+    )
+
+
+def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
+    """Whether the CANN MegaMoe (FUSED_MC2) op should drive the MoE layers.
+
+    MegaMoe replaces dispatch + grouped-matmul + swiglu + combine with a single
+    fused op. On A5 (Ascend 950PR/DT) it only implements the MXFP scenarios, so
+    the model/parallel shape is additionally validated against the discrete
+    value sets in the CANN-shipped mega_moe.md.
+    """
+    if not (is_mega_moe_supported() and get_ascend_config().enable_fused_mc2 == 1):
+        return False
+    if not (is_moe_model(vllm_config) and vllm_config.parallel_config.enable_expert_parallel):
+        return False
+    # The symm-buffer handshake is a collective over the EP group; the op
+    # constrains ep_world_size to [2, 1024] and vllm-ascend caps it at 64.
+    if not 1 < get_ep_group().world_size <= 64:
+        return False
+    if getattr(vllm_config, "lora_config", None) is not None:
+        return False
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        return is_a5_megamoe_supported_by_config(vllm_config)
+    return True
 
 
 def _select_a2_moe_comm_method(
@@ -301,7 +375,15 @@ def _select_a5_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
+    is_draft_model: bool = False,
+    draft_moe_quant_type: QuantType = QuantType.NONE,
 ) -> MoECommType:
+    if use_cann_megamoe(vllm_config):
+        # The A5 MegaMoe op only accepts a subset of quantized weight layouts
+        # (MXFP only). An unquantized / unsupported-quantized MTP draft MoE
+        # layer must skip FUSED_MC2 and fall through to the original paths.
+        if not (is_draft_model and draft_moe_quant_type not in A5_SUPPORT_MEGA_MOE_QUANT_TYPES):
+            return MoECommType.FUSED_MC2
     num_experts_per_tok = getattr(
         vllm_config.model_config.hf_text_config,
         "num_experts_per_tok",
@@ -366,7 +448,18 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             get_ascend_config().enable_fused_mc2,
         )
     elif soc_version == AscendDeviceType.A5:
-        moe_comm_type = _select_a5_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
+        if is_draft_model:
+            draft_model_config = getattr(vllm_config.speculative_config, "draft_model_config", None)
+            draft_moe_quant_type = getattr(draft_model_config, "draft_moe_quant_type", QuantType.NONE)
+        else:
+            draft_moe_quant_type = QuantType.NONE
+        moe_comm_type = _select_a5_moe_comm_method(
+            num_tokens,
+            vllm_config,
+            mc2_tokens_capacity,
+            is_draft_model=is_draft_model,
+            draft_moe_quant_type=draft_moe_quant_type,
+        )
     elif soc_version == AscendDeviceType._310P:
         moe_comm_type = MoECommType.ALLGATHER
 
@@ -399,6 +492,8 @@ class _ExtraForwardContextProxy:
         "mc2_mask",
         "is_draft_model",
         "is_draft_model_prefill",
+        "use_mega_moe",
+        "is_decode_only_node",
         "prefetch_mlp_gate_up_proj",
         "prefetch_mlp_down_proj",
         "model_instance",
