@@ -28,6 +28,7 @@ from fla_npu.ops.ascendc import (
 from torch import nn
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.utils import replace_parameter
@@ -48,10 +49,38 @@ from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+from vllm_ascend.ops.triton.fused_gdn_gating_l2norm import (
+    fused_gdn_gating_l2norm,
+    fusion_matches_l2norm_backend,
+)
+from vllm_ascend.ops.triton.fused_gdn_gating_l2norm import fused_gdn_gating_l2norm
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 
+logger = init_logger(__name__)
+
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+
+
+@lru_cache(maxsize=1)
+def _gate_norm_fusion_enabled() -> bool:
+    """Read the fusion switch once; it cannot change within a process.
+
+    The fused kernel reproduces one specific ``l2norm_fwd`` backend bit for
+    bit, so it stays off when ``USE_DEFAULT_FLA_NORM`` selects another one.
+    """
+    import vllm_ascend.envs as ascend_envs
+
+    if not ascend_envs.VLLM_ASCEND_ENABLE_GDN_GATE_NORM_FUSION:
+        return False
+    if not fusion_matches_l2norm_backend():
+        logger.warning(
+            "VLLM_ASCEND_ENABLE_GDN_GATE_NORM_FUSION is set but "
+            "USE_DEFAULT_FLA_NORM selects an l2norm backend the fused kernel "
+            "does not mirror; keeping the unfused GDN gating path."
+        )
+        return False
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -677,7 +706,22 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        # The pure-spec-decode path (no prefill, no plain decode) keeps g/beta
+        # un-sliced, so the gating and the Q/K l2norm can share one launch.
+        fuse_gate_norm = (
+            _gate_norm_fusion_enabled()
+            and spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and query_spec is not None
+            and key_spec is not None
+        )
+        if fuse_gate_norm:
+            g, beta, query_spec, key_spec = fused_gdn_gating_l2norm(
+                self.A_log, a, b, self.dt_bias, query_spec, key_spec
+            )
+        else:
+            g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
@@ -703,8 +747,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
-            query_spec = l2norm_fwd(query_spec)
-            key_spec = l2norm_fwd(key_spec)
+            if not fuse_gate_norm:
+                query_spec = l2norm_fwd(query_spec)
+                key_spec = l2norm_fwd(key_spec)
             core_attn_out_spec = recurrent_gated_delta_rule(
                 query_spec.squeeze(0),
                 key_spec.squeeze(0),
