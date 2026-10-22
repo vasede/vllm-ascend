@@ -336,7 +336,11 @@ def _all_gather_matmul_prequant_mxfp8_impl(
     group_size: int,
     label: bool,
     e8m0: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Returns (out, gathered_x, gathered_scale). The gathered activation is a
+    # by-product the fused kernel already writes (gather_output defaults True),
+    # so handing it back costs nothing and lets sibling Linears on the same
+    # hidden_states skip their own collective entirely.
     # MC2 column half: fused all_gather + quant matmul, taking PRE-QUANTIZED
     # (quantized_x, pertoken_scale) as input so the upstream norm+quant fusion
     # (npu_add_rms_norm_dynamic_mx_quant) stays visible to torch.compile and is
@@ -374,10 +378,22 @@ def _all_gather_matmul_prequant_mxfp8_impl(
             y_dtype=283, comm_mode="ai_cpu",
         )
         out = o[0] if isinstance(o, (tuple, list)) else o
+        # o[1] is the gathered x1 ([T*ws, K] fp8) when gather_index=0 and
+        # gather_output=True; see torch_npu meta npu_all_gather_quant_mm_meta.
+        gx = o[1] if isinstance(o, (tuple, list)) and len(o) > 1 else None
+        if gx is not None and gx.numel() == 0:
+            gx = None
+        # The kernel takes x1_scale as input and does not gather it, so the
+        # per-token scale still needs its own collective. It is T*4B against
+        # T*K for the payload, i.e. noise next to the fp8 gather it saves.
+        gs = tensor_model_parallel_all_gather(pertoken_scale, 0) if gx is not None else None
         pad = _EXTRA_CTX.pad_size
         if pad > 0:
             out = out[:-pad]
-        return out
+            if gx is not None:
+                gx = gx[:-pad]
+                gs = gs[:-pad]
+        return out, gx, gs
 
     # decode / small / non-flash: gather (fp8) then plain quant matmul
     if flash and label:
@@ -389,11 +405,14 @@ def _all_gather_matmul_prequant_mxfp8_impl(
             pg = pg[:-pad]
     else:
         qg, pg = quantized_x, pertoken_scale
-    return torch_npu.npu_quant_matmul(
+    out = torch_npu.npu_quant_matmul(
         qg, weight, weight_scale, scale_dtype=e8m0,
         pertoken_scale=pg, pertoken_scale_dtype=e8m0,
         output_dtype=torch.bfloat16, group_sizes=[1, 1, group_size],
     )
+    # These paths gathered explicitly (or not at all), so qg/pg are already the
+    # tensors a sibling Linear would need.
+    return out, qg, pg
 
 
 def _all_gather_matmul_prequant_mxfp8_fake(
@@ -405,10 +424,15 @@ def _all_gather_matmul_prequant_mxfp8_fake(
     group_size: int,
     label: bool,
     e8m0: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     n = weight.shape[1]
-    m = quantized_x.shape[0] * world_size if (_EXTRA_CTX.flash_comm_v1_enabled and label) else quantized_x.shape[0]
-    return torch.empty((m, n), device=quantized_x.device, dtype=torch.bfloat16)
+    gathered = _EXTRA_CTX.flash_comm_v1_enabled and label
+    m = quantized_x.shape[0] * world_size if gathered else quantized_x.shape[0]
+    return (
+        torch.empty((m, n), device=quantized_x.device, dtype=torch.bfloat16),
+        torch.empty((m, quantized_x.shape[1]), device=quantized_x.device, dtype=quantized_x.dtype),
+        torch.empty((m, *pertoken_scale.shape[1:]), device=quantized_x.device, dtype=pertoken_scale.dtype),
+    )
 
 
 direct_register_custom_op(

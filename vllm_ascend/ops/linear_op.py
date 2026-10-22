@@ -569,20 +569,30 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
             and isinstance(self.quant_method, AscendLinearMethod)
             and isinstance(getattr(self.quant_method, "quant_method", None), AscendW8A8MXFP8DynamicLinearMethod)
         )
-        
         scope = _sp_gather_scope()
         if prequant_ag:
             group_size = self.quant_method.quant_method.group_size
             if matmul_all_gather_enable():
-                # MC2 column fusion: the collective lives inside the fused op,
-                # so there is no standalone gather to share. Left as-is.
+                # MC2 column fusion. Only the FIRST Linear on a given
+                # hidden_states fuses AllGather with its matmul; the fused
+                # kernel hands back the gathered activation, so the siblings
+                # (ba / z) run a plain quant matmul on it with no collective.
                 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 
-                quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(input_, dst_type=torch.float8_e4m3fn)
-                output_parallel = torch.ops.vllm.all_gather_matmul_prequant_mxfp8(
-                    quantized_x, pertoken_scale, self.layer.weight, self.layer.weight_scale,
-                    self.tp_size, group_size, need_all_gather, int(FLOAT8_E8M0FNU_DTYPE),
-                )
+                key = ("mc2", group_size, need_all_gather)
+                hit = scope.get(key) if scope is not None else None
+                if hit is not None and hit[0] is input_:
+                    output_parallel = self.quant_method.apply(self.layer, (hit[1], hit[2]), bias)
+                else:
+                    quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                        input_, dst_type=torch.float8_e4m3fn
+                    )
+                    output_parallel, gx, gs = torch.ops.vllm.all_gather_matmul_prequant_mxfp8(
+                        quantized_x, pertoken_scale, self.layer.weight, self.layer.weight_scale,
+                        self.tp_size, group_size, need_all_gather, int(FLOAT8_E8M0FNU_DTYPE),
+                    )
+                    if scope is not None and gx is not None and gx.numel() > 0:
+                        scope[key] = (input_, gx, gs)
             else:
                 key = ("mxfp8", group_size, need_all_gather)
                 hit = scope.get(key) if scope is not None else None
@@ -615,6 +625,7 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
                 if scope is not None:
                     scope[key] = (src, input_)
             output_parallel = self.quant_method.apply(self.layer, input_, bias)
+
 
         if self.gather_output:
             # All-gather across the partitions.
