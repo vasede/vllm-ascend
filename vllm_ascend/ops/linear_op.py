@@ -44,6 +44,8 @@ from functools import lru_cache
 from types import SimpleNamespace
 
 import regex as re
+import contextlib
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -507,6 +509,36 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         return group.get_hccl_comm_name(rank)
 
 
+# ---- FlashComm1 shared-input AllGather dedup -------------------------------
+# Several column-parallel Linears can be fed the exact same hidden_states
+# (GDN: in_proj_qkv / in_proj_ba / in_proj_z, or in_proj_qkvz / in_proj_ba).
+# apply_impl() below all_gathers its own input, so with N such Linears the
+# same bytes cross the link N times. shared_sp_gather() opens a scope where
+# the first gather is kept and its payload reused by the rest.
+#
+# The retained collective still runs AFTER npu_dynamic_mx_quant, so what moves
+# is the fp8 + E8M0 payload, not bf16. Per-token mx-quant is row-independent
+# and the cache is keyed on the producing group_size, so reuse is bit-exact.
+# Reuse additionally requires the cached entry to come from the *same* source
+# tensor object, so a mis-scoped `with` block degrades to today's behaviour
+# instead of handing a Linear the wrong activation.
+_SP_GATHER_SCOPE: list[dict] = []
+
+
+@contextlib.contextmanager
+def shared_sp_gather():
+    """Share one FlashComm1 input all_gather across Linears on one tensor."""
+    _SP_GATHER_SCOPE.append({})
+    try:
+        yield
+    finally:
+        _SP_GATHER_SCOPE.pop()
+
+
+def _sp_gather_scope():
+    return _SP_GATHER_SCOPE[-1] if _SP_GATHER_SCOPE else None
+
+
 class SequenceColumnParallelOp(CustomColumnParallelOp):
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         """Linear layer with column parallelism.
@@ -537,27 +569,51 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
             and isinstance(self.quant_method, AscendLinearMethod)
             and isinstance(getattr(self.quant_method, "quant_method", None), AscendW8A8MXFP8DynamicLinearMethod)
         )
+        
+        scope = _sp_gather_scope()
         if prequant_ag:
-            # quant stays OUTSIDE any custom op so norm+quant fuses
-            # (npu_add_rms_norm_dynamic_mx_quant) via fuse_norm_quant pass.
-            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(input_, dst_type=torch.float8_e4m3fn)
+            group_size = self.quant_method.quant_method.group_size
             if matmul_all_gather_enable():
-                # MC2 column fusion: fused all_gather + quant matmul on the
-                # pre-quantized activation (both norm+quant AND AG+matmul fuse).
+                # MC2 column fusion: the collective lives inside the fused op,
+                # so there is no standalone gather to share. Left as-is.
                 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 
-                group_size = self.quant_method.quant_method.group_size
+                quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(input_, dst_type=torch.float8_e4m3fn)
                 output_parallel = torch.ops.vllm.all_gather_matmul_prequant_mxfp8(
                     quantized_x, pertoken_scale, self.layer.weight, self.layer.weight_scale,
                     self.tp_size, group_size, need_all_gather, int(FLOAT8_E8M0FNU_DTYPE),
                 )
             else:
-                # step-3: pre-AllGather quant (fp8 gather) + plain quant matmul
-                quantized_x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(quantized_x, label=need_all_gather)
-                pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, label=need_all_gather)
+                key = ("mxfp8", group_size, need_all_gather)
+                hit = scope.get(key) if scope is not None else None
+                if hit is not None and hit[0] is input_:
+                    _, quantized_x, pertoken_scale = hit
+                else:
+                    # quant stays OUTSIDE any custom op so norm+quant fuses
+                    # (npu_add_rms_norm_dynamic_mx_quant) via fuse_norm_quant pass.
+                    quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                        input_, dst_type=torch.float8_e4m3fn
+                    )
+                    # step-3: pre-AllGather quant (fp8 gather) + plain quant matmul
+                    quantized_x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                        quantized_x, label=need_all_gather
+                    )
+                    pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                        pertoken_scale, label=need_all_gather
+                    )
+                    if scope is not None:
+                        scope[key] = (input_, quantized_x, pertoken_scale)
                 output_parallel = self.quant_method.apply(self.layer, (quantized_x, pertoken_scale), bias)
         else:
-            input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
+            key = ("raw", input_.dtype, need_all_gather)
+            hit = scope.get(key) if scope is not None else None
+            if hit is not None and hit[0] is input_:
+                input_ = hit[1]
+            else:
+                src = input_
+                input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
+                if scope is not None:
+                    scope[key] = (src, input_)
             output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
         if self.gather_output:
