@@ -225,6 +225,24 @@ def _split_head_first_conv_output(
     return tuple(part.transpose(0, 1).unsqueeze(0) for part in (q, k, v))
 
 
+def _select_decode_qk(
+    split_conv: bool,
+    decode_conv_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    query_non_spec: torch.Tensor,
+    key_non_spec: torch.Tensor,
+    num_decode_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the decode q/k of a mixed non-spec batch, as section 2.2 does.
+
+    The split-conv1d path hands the decode rows over separately; otherwise they
+    are the leading slice of the non-spec tensors.
+    """
+    if split_conv:
+        assert decode_conv_qkv is not None
+        return decode_conv_qkv[0], decode_conv_qkv[1]
+    return query_non_spec[:, :num_decode_tokens], key_non_spec[:, :num_decode_tokens]
+
+
 def _rearrange_decode_qkv(
     mixed_qkv: torch.Tensor,
     key_dim: int,
@@ -706,20 +724,55 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
-        # The pure-spec-decode path (no prefill, no plain decode) keeps g/beta
-        # un-sliced, so the gating and the Q/K l2norm can share one launch.
+        # Any spec batch fuses, mixed included. The kernel sizes the gate
+        # (num_tokens) and the norms (norm_rows) from separate arguments and the
+        # two sections touch disjoint tensors, so a/b may span the whole batch
+        # while q/k only hold the spec tokens. The gate therefore stays
+        # full-batch exactly as in the unfused path, and the index_select below
+        # slices the fused gate the same way it sliced the unfused one.
         fuse_gate_norm = (
             _gate_norm_fusion_enabled()
             and spec_sequence_masks is not None
-            and attn_metadata.num_prefills == 0
-            and attn_metadata.num_decodes == 0
             and query_spec is not None
             and key_spec is not None
         )
+        # With MTP off the decode rows travel as non-spec tensors instead, and
+        # their l2norm sits further down (2.2 for a mixed batch, 2.3 for a pure
+        # decode one). Both have their q/k ready here, so the same single launch
+        # applies; only the tensor it normalizes differs.
+        #
+        # A mixed non-spec batch normalizes just the decode slice: the prefill
+        # half gets its l2norm inside chunk_gated_delta_rule
+        # (use_qk_l2norm_in_kernel=True), not as a separate launch.
+        fuse_decode_gate_norm = (
+            _gate_norm_fusion_enabled()
+            and spec_sequence_masks is None
+            and attn_metadata.num_decodes > 0
+            and query_non_spec is not None
+            and key_non_spec is not None
+        )
+        fuse_mixed_decode = fuse_decode_gate_norm and attn_metadata.num_prefills > 0
+        fuse_pure_decode = fuse_decode_gate_norm and attn_metadata.num_prefills == 0
+        # Set by the mixed path so 2.2 picks up the already-normalized decode q/k.
+        fused_decode_qk = None
         if fuse_gate_norm:
             g, beta, query_spec, key_spec = fused_gdn_gating_l2norm(
                 self.A_log, a, b, self.dt_bias, query_spec, key_spec
             )
+        elif fuse_pure_decode:
+            # a/b were sliced to num_actual_tokens above, which for a pure decode
+            # batch is exactly the decode rows, so both extents agree.
+            g, beta, query_non_spec, key_non_spec = fused_gdn_gating_l2norm(
+                self.A_log, a, b, self.dt_bias, query_non_spec, key_non_spec
+            )
+        elif fuse_mixed_decode:
+            decode_q, decode_k = _select_decode_qk(
+                split_conv, decode_conv_qkv, query_non_spec, key_non_spec, attn_metadata.num_decode_tokens
+            )
+            g, beta, fused_q, fused_k = fused_gdn_gating_l2norm(
+                self.A_log, a, b, self.dt_bias, decode_q.contiguous(), decode_k.contiguous()
+            )
+            fused_decode_qk = (fused_q, fused_k)
         else:
             g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
@@ -781,8 +834,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 key_decode = key_non_spec[:, :num_decode_tokens]
                 value_decode = value_non_spec[:, :num_decode_tokens]
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            query_decode = l2norm_fwd(query_decode.contiguous())
-            key_decode = l2norm_fwd(key_decode.contiguous())
+            if fused_decode_qk is not None:
+                query_decode, key_decode = fused_decode_qk
+            else:
+                query_decode = l2norm_fwd(query_decode.contiguous())
+                key_decode = l2norm_fwd(key_decode.contiguous())
             core_attn_out_decode = recurrent_gated_delta_rule(
                 query_decode.squeeze(0),
                 key_decode.squeeze(0),
@@ -906,8 +962,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         elif attn_metadata.num_decodes > 0:
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            query_non_spec = l2norm_fwd(query_non_spec)
-            key_non_spec = l2norm_fwd(key_non_spec)
+            if not fuse_pure_decode:
+                query_non_spec = l2norm_fwd(query_non_spec)
+                key_non_spec = l2norm_fwd(key_non_spec)
             core_attn_out_non_spec = recurrent_gated_delta_rule(
                 query_non_spec.squeeze(0),
                 key_non_spec.squeeze(0),
