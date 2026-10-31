@@ -37,9 +37,10 @@ except ImportError:
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
+from vllm_ascend.ops.mlp_weight_prefetch import dense_mlp_with_prefetch
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
 from vllm_ascend.patch.worker.patch_qwen3_5_gdn_split import apply_gdn_qkv_split_patch
-from vllm_ascend.utils import enable_dense_sp
+from vllm_ascend.utils import enable_dense_sp, get_weight_prefetch_method
 
 _GDN_PATCH_TARGET = _GDNBaseCls
 _GDN_ORIGINAL_INIT = _GDN_PATCH_TARGET.__init__
@@ -66,6 +67,20 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
         from the q/k/v split on sees the full rows either way.
         """
         (qkv,) = project_with_shared_quant(self, hidden_states, ("qkv_proj",), sp_num_tokens)
+        # Resolve o_proj's prefetch ratio once: the split op issues the fetch
+        # and attention_gate_with_prefetch() joins it, and the two guards must
+        # agree. linear_attn gets the same treatment inside gdn.py.
+        prefetch_method = get_weight_prefetch_method()
+        o_proj_ratio = (
+            float(prefetch_method.attn.prefetch_ratio.get("o", 0))
+            if prefetch_method is not None and prefetch_method.attn.enable
+            else 0.0
+        )
+        # Only the fused-kernel branch below reaches the issue site, and this
+        # forward is patched onto Qwen3NextAttention globally, so the other
+        # branch must not close a fence nothing opened.
+        if "qwen3_5" not in self.config.model_type or not self.attn_output_gate:
+            o_proj_ratio = 0.0
         if _uses_multimodal_rope(self):
             # MRV2 MTP uses 1D text positions; the fused kernel reads three planes.
             if positions.ndim == 1:
@@ -89,6 +104,8 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
                 is_interleaved=self.rotary_emb.mrope_interleaved,
                 rope_dim=self.rotary_emb.rotary_dim,
                 has_gate=self.attn_output_gate,
+                o_proj_weight=self.o_proj.weight if o_proj_ratio > 0 else None,
+                o_proj_ratio=o_proj_ratio,
             )
         else:
             if self.attn_output_gate:
@@ -109,8 +126,14 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
         attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if o_proj_ratio > 0:
+                # Joins the fetch the split op forked before the attention core.
+                attn_output = torch.ops.vllm.attention_gate_with_prefetch(
+                    attn_output, gate, self.o_proj.weight, o_proj_ratio
+                )
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         out, _ = self.o_proj(attn_output)
         if output is not None:
@@ -191,17 +214,31 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
             hidden_states = sp_reduce_scatter(hidden_states)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if use_sp:
-            if isinstance(self.mlp, Qwen3NextSparseMoeBlock):
-                hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
-            else:
-                # TP-sharded dense weights must see the same token rows on
-                # every rank; restore the padded full sequence for the MLP,
-                # then reduce its TP partial output back to the local shard.
-                hidden_states = _sequence_parallel_dense_mlp_forward(self.mlp, hidden_states)
+        # The prefetch path fuses post_attention_layernorm + MLP itself and
+        # issues the dense-MLP weight prefetch from its custom ops. It is
+        # incompatible with the SP layout (dense SP needs the full-sequence
+        # gather and down_proj's TP partial sums for the reduce-scatter), so
+        # SP keeps the gather/scatter path below.
+        weight_prefetch_method = get_weight_prefetch_method()
+        if (
+            not use_sp
+            and weight_prefetch_method is not None
+            and weight_prefetch_method.use_qwen_dense_mlp_prefetch
+            and hasattr(self.mlp, "gate_up_proj")
+        ):
+            hidden_states, residual = dense_mlp_with_prefetch(self, hidden_states, residual, weight_prefetch_method)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            if use_sp:
+                if isinstance(self.mlp, Qwen3NextSparseMoeBlock):
+                    hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
+                else:
+                    # TP-sharded dense weights must see the same token rows on
+                    # every rank; restore the padded full sequence for the MLP,
+                    # then reduce its TP partial output back to the local shard.
+                    hidden_states = _sequence_parallel_dense_mlp_forward(self.mlp, hidden_states)
+            else:
+                hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
