@@ -146,7 +146,7 @@ constexpr aclDataType kATenScalarTypeToAclDataTypeTable
   memcpy(g_hashBuf + g_hashOffset, data_expression, size_expression); \
   g_hashOffset += size_expression;
 
-inline bool IsOpInputBaseFormat(const at::Tensor &tensor)
+bool IsOpInputBaseFormat(const at::Tensor &tensor)
 {
     if (!tensor.is_privateuseone()) {
         return true;
