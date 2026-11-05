@@ -1,0 +1,1045 @@
+diff --git a/csrc/aclnn_torch_adapter/op_api_common.h b/csrc/aclnn_torch_adapter/op_api_common.h
+index 20454e72775b5232332eacf9ac8110c19f6523f4..46338f9df595bbf270dba35ec757d2366ab41fdf 100644
+--- a/csrc/aclnn_torch_adapter/op_api_common.h
++++ b/csrc/aclnn_torch_adapter/op_api_common.h
+@@ -146,7 +146,7 @@ constexpr aclDataType kATenScalarTypeToAclDataTypeTable
+   memcpy(g_hashBuf + g_hashOffset, data_expression, size_expression); \
+   g_hashOffset += size_expression;
+ 
+-bool IsOpInputBaseFormat(const at::Tensor &tensor)
++inline bool IsOpInputBaseFormat(const at::Tensor &tensor)
+ {
+     if (!tensor.is_privateuseone()) {
+         return true;
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 22891d265f4a88ddeefe7782b2a4d66ee1889fd4..11d435033be8104609078fab508eefe0c62fa317 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -189,10 +189,14 @@ class AscendFusionConfig:
+             (``vllm_ascend/ops/triton/fused_gdn_gating_l2norm.py``). The fused
+             kernel mirrors one specific ``l2norm_fwd`` backend bit for bit and
+             is skipped when ``USE_DEFAULT_FLA_NORM`` selects another one.
++        fusion_ops_mega_gdn_decode: Use the xLLM MegaGdnDecode operator for
++            BF16, non-speculative, pure decode batches on Ascend 950. Requires
++            the custom OPP package; unsupported batches keep the existing path.
+     """
+ 
+     fusion_ops_gmmswigluquant: bool = True
+     fusion_ops_gdn_gate_norm: bool = False
++    fusion_ops_mega_gdn_decode: bool = False
+ 
+ 
+ @config(config=ConfigDict(frozen=True))
+@@ -474,7 +478,8 @@ class AscendConfig:
+             },
+             "ascend_fusion_config": {
+                 "fusion_ops_gmmswigluquant": true,
+-                "fusion_ops_gdn_gate_norm": false
++                "fusion_ops_gdn_gate_norm": false,
++                "fusion_ops_mega_gdn_decode": false
+             },
+             "ascend_warmup_config": {
+                 "enable_early_kernel_warmup": false,
+@@ -652,9 +657,7 @@ class AscendConfig:
+     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
+     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
+     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+-    weight_prefetch_config: Any = dataclasses.field(
+-        default_factory=lambda: WeightPrefetchConfig({})
+-    )
++    weight_prefetch_config: Any = dataclasses.field(default_factory=lambda: WeightPrefetchConfig({}))
+     # Still factory-injected: construction depends on vllm_config.
+     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
+     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
+@@ -1523,6 +1526,7 @@ class XliteGraphConfig:
+                 vllm_config.cache_config.block_size,
+             )
+ 
++
+ class WeightPrefetchConfig:
+     """Configuration Object for weight_prefetch_config from additional_config"""
+ 
+@@ -1536,6 +1540,7 @@ class WeightPrefetchConfig:
+         self.enabled = weight_prefetch_config.get("enabled", False)
+         self.prefetch_ratio = weight_prefetch_config.get("prefetch_ratio", self.prefetch_ratio)
+ 
++
+ @config
+ class ProfilingChunkConfig:
+     """Configuration for profiling-based dynamic chunk sizing.
+@@ -1973,11 +1978,10 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
+         raw_weight_prefetch = {}
+     elif not isinstance(raw_weight_prefetch, dict):
+         raise ValueError(
+-            f"additional_config.weight_prefetch_config must be a dict, "
+-            f"got {type(raw_weight_prefetch).__name__}."
++            f"additional_config.weight_prefetch_config must be a dict, got {type(raw_weight_prefetch).__name__}."
+         )
+     weight_prefetch_config = WeightPrefetchConfig(raw_weight_prefetch)
+-    
++
+     new_config = AscendConfig(  # type: ignore[call-arg]
+         scheduler_config=sched,
+         sparse_kv_offload_config=sparse_kv,
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index 970aa2fee54e0f989a4774c735fa23643f9999dc..29646ce30b15cf323d3c6e4d118f26a22d754395 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -46,6 +46,12 @@ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+ from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
++from vllm_ascend.ops.mega_gdn_decode import (
++    mega_gdn_decode_enabled,
++    prepare_mega_gdn_weights,
++    run_mega_gdn_decode,
++    supports_mega_gdn_decode,
++)
+ from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
+ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+@@ -155,6 +161,8 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
+     def process_weights_and_pack(*args, **kwargs):
+         result = process_weights_after_loading(*args, **kwargs)
+         _pack_conv_weights(conv1d)
++        if mega_gdn_decode_enabled():
++            prepare_mega_gdn_weights(layer)
+         return result
+ 
+     quant_method.process_weights_after_loading = process_weights_and_pack
+@@ -482,6 +490,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+             device=hidden_states.device,
+         )
+ 
++        if mega_gdn_decode_enabled() and self.num_spec == 0:
++            torch.ops.vllm.ascend_gdn_core_with_norm(mixed_qkv, z, b, a, core_attn_out, self.prefix)
++            out, _ = self.out_proj(core_attn_out.flatten(-2))
++            if output is not None:
++                output[:num_tokens] = out
++            return out
++
+         torch.ops.vllm.qwen_gdn_attention_core(
+             mixed_qkv,
+             b,
+@@ -533,6 +548,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+         b: torch.Tensor,
+         a: torch.Tensor,
+         core_attn_out: torch.Tensor,
++        mega_z: torch.Tensor | None = None,
+     ):
+         """
+         Core attention computation (called by custom op).
+@@ -579,6 +595,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+ 
+         # 1. Convolution sequence transformation
+         conv_weights_T = _get_packed_conv_weights(self)
++        if mega_z is not None:
++            z_decode = mega_z[:num_actual_tokens]
++            if supports_mega_gdn_decode(self, attn_metadata, mixed_qkv, z_decode, b, a, conv_weights_T, core_attn_out):
++                run_mega_gdn_decode(self, attn_metadata, mixed_qkv, z_decode, b, a, conv_weights_T, core_attn_out)
++                maybe_save_kv_layer_to_connector("", [])
++                return True
+         if spec_sequence_masks is not None:
+             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                 mixed_qkv_spec = mixed_qkv
+diff --git a/benchmarks/benchmark_mega_gdn_decode.py b/benchmarks/benchmark_mega_gdn_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c9cbf0e8a043ca73d7c1d80e6584666cf4c25a8
+--- /dev/null
++++ b/benchmarks/benchmark_mega_gdn_decode.py
+@@ -0,0 +1,137 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Compare the existing GDN core + norm with MegaGdnDecode on one NPU."""
++
++import argparse
++import copy
++import importlib.util
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--batch", type=int, default=4)
++    parser.add_argument("--key-heads", type=int, default=4)
++    parser.add_argument("--value-heads", type=int, default=8)
++    parser.add_argument("--repeats", type=int, default=100)
++    parser.add_argument(
++        "--max-slowdown",
++        type=float,
++        default=None,
++        help="Optional graph-latency regression limit for a controlled device",
++    )
++    options = parser.parse_args()
++    test_path = (
++        Path(__file__).resolve().parents[1] / "tests/e2e/nightly/single_node/ops/singlecard_ops/test_mega_gdn_decode.py"
++    )
++    spec = importlib.util.spec_from_file_location("mega_gdn_cases", test_path)
++    cases = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(cases)
++
++    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
++
++    import vllm_ascend.ops.gdn as gdn
++    from vllm_ascend.ops.gdn_attn_builder import GDNCausalConv1dMetadata, GDNDecodeMetadata
++    from vllm_ascend.ops.layernorm import LayerNormFn
++    from vllm_ascend.ops.mega_gdn_decode import run_mega_gdn_decode
++    from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
++    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
++
++    def elapsed(fn):
++        for _ in range(5):
++            fn()
++        torch.npu.synchronize()
++        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
++        start.record()
++        for _ in range(options.repeats):
++            fn()
++        end.record()
++        torch.npu.synchronize()
++        return start.elapsed_time(end) * 1000 / options.repeats
++
++    def graph(fn):
++        for _ in range(3):
++            fn()
++        torch.npu.synchronize()
++        result = torch.npu.NPUGraph()
++        with torch.npu.graph(result):
++            fn()
++        return result
++
++    print("cache,existing_eager_us,mega_eager_us,existing_graph_us,mega_graph_us,graph_speedup")
++    for padded in (False, True):
++        args = cases._case(options.batch, options.key_heads, options.value_heads, padded)
++        init_device_properties_triton()
++        layer, metadata, qkv, z, b, a, weight, _ = args
++        baseline = copy.copy(layer)
++
++        def clone_state(value):
++            storage = torch.empty((value.shape[0], value.stride(0)), dtype=value.dtype, device=value.device)
++            result = storage.as_strided(value.shape, value.stride())
++            result.copy_(value)
++            return result
++
++        baseline.kv_cache = tuple(clone_state(t) for t in layer.kv_cache)
++        baseline.prefix = "benchmark.linear_attn"
++        batch = options.batch
++        indices = metadata.non_spec_state_indices_tensor
++        query_start = torch.arange(batch + 1, dtype=torch.int32).npu()
++        lengths = torch.cat((torch.zeros(1, dtype=torch.int32), torch.ones(batch, dtype=torch.int32))).npu()
++        meta = GDNAttentionMetadata(
++            num_prefills=0,
++            num_prefill_tokens=0,
++            num_decodes=batch,
++            num_decode_tokens=batch,
++            num_spec_decodes=0,
++            num_spec_decode_tokens=0,
++            num_actual_tokens=batch,
++            spec_sequence_masks=None,
++            non_spec_state_indices_tensor=indices,
++            non_spec_query_start_loc=query_start,
++        )
++        meta.non_spec_decode_metadata = GDNDecodeMetadata(
++            causal_conv1d=GDNCausalConv1dMetadata(
++                query_start_loc=query_start, cache_indices=indices, initial_state_mode=None
++            ),
++            actual_seq_lengths=lengths,
++        )
++        raw = torch.zeros_like(z)
++
++        def old(baseline=baseline, qkv=qkv, b=b, a=a, raw=raw, layer=layer, z=z):
++            gdn.AscendGatedDeltaNetAttention._forward_core(baseline, qkv, b, a, raw)
++            return LayerNormFn.apply(
++                raw.reshape(-1, 128), layer.norm.weight, None, z.reshape(-1, 128), 1e-6, None, True, True
++            )
++
++        def new(args=args):
++            run_mega_gdn_decode(*args)
++
++        with (
++            patch.object(
++                gdn, "get_forward_context", return_value=SimpleNamespace(attn_metadata={baseline.prefix: meta})
++            ),
++            patch.object(gdn, "get_weight_prefetch_method", return_value=None),
++            patch.object(gdn, "wait_for_kv_layer_from_connector"),
++            patch.object(gdn, "record_attention_compute_start"),
++            patch.object(gdn, "maybe_save_kv_layer_to_connector"),
++            patch.object(gdn, "_get_packed_conv_weights", return_value=weight),
++            patch.object(gdn, "_gate_norm_fusion_enabled", return_value=False),
++            patch.object(gdn.DeviceOperator, "fused_gdn_gating", fused_gdn_gating_patch),
++        ):
++            old_eager, new_eager = elapsed(old), elapsed(new)
++            old_graph, new_graph = graph(old), graph(new)
++            old_us, new_us = elapsed(old_graph.replay), elapsed(new_graph.replay)
++        print(
++            f"{'strided' if padded else 'contiguous'},{old_eager:.3f},{new_eager:.3f},"
++            f"{old_us:.3f},{new_us:.3f},{old_us / new_us:.3f}",
++            flush=True,
++        )
++        if options.max_slowdown is not None:
++            assert new_us / old_us <= options.max_slowdown
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/csrc/mega_gdn_decode.cpp b/csrc/mega_gdn_decode.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..beaf7fb84c0ba978b0d646a9fa2b696c9f915462
+--- /dev/null
++++ b/csrc/mega_gdn_decode.cpp
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++#include <torch/library.h>
++#include "aclnn_torch_adapter/op_api_common.h"
++
++namespace vllm_ascend {
++void mega_gdn_decode(
++    const at::Tensor& qkv, const at::Tensor& z, const at::Tensor& b,
++    const at::Tensor& a, const at::Tensor& conv_weight,
++    const at::Tensor& conv_state, const at::Tensor& a_log,
++    const at::Tensor& dt_bias, const at::Tensor& ssm_state,
++    const at::Tensor& read_indices, const at::Tensor& write_indices,
++    const at::Tensor& norm_weight, const at::Tensor& conv_out,
++    const at::Tensor& out, bool fla_ssm_state_layout) {
++  for (const auto& tensor : {qkv, z, b, a, conv_weight, conv_state,
++                             a_log, dt_bias, ssm_state, read_indices,
++                             write_indices, norm_weight, conv_out, out}) {
++    TORCH_CHECK(tensor.is_contiguous(), "MegaGdnDecode requires contiguous tensors");
++    TORCH_CHECK(tensor.device() == qkv.device(), "MegaGdnDecode device mismatch");
++  }
++  for (const auto& tensor : {qkv, z, b, a, conv_weight, conv_state,
++                             norm_weight, conv_out, out}) {
++    TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, "MegaGdnDecode requires BF16 activations");
++  }
++  for (const auto& tensor : {a_log, dt_bias, ssm_state}) {
++    TORCH_CHECK(tensor.scalar_type() == at::kFloat, "MegaGdnDecode requires FP32 state/decay weights");
++  }
++  TORCH_CHECK(read_indices.scalar_type() == at::kInt && write_indices.scalar_type() == at::kInt,
++              "MegaGdnDecode indices must be INT32");
++  TORCH_CHECK(conv_out.sizes() == qkv.sizes() && out.sizes() == z.sizes(), "MegaGdnDecode output shape mismatch");
++  EXEC_NPU_CMD(aclnnMegaGdnDecode, qkv, z, b, a, conv_weight, conv_state,
++               a_log, dt_bias, ssm_state, read_indices, write_indices,
++               norm_weight, fla_ssm_state_layout, conv_out, conv_state, ssm_state, out);
++}
++}  // namespace vllm_ascend
++
++TORCH_LIBRARY_FRAGMENT(_C_ascend, m) {
++  m.def("mega_gdn_decode(Tensor qkv, Tensor z, Tensor b, Tensor a, Tensor conv_weight, "
++        "Tensor(a!) conv_state, Tensor a_log, Tensor dt_bias, Tensor(b!) ssm_state, "
++        "Tensor read_indices, Tensor write_indices, Tensor norm_weight, "
++        "Tensor(c!) conv_out, Tensor(d!) out, bool fla_ssm_state_layout=True) -> ()");
++  m.impl("mega_gdn_decode", torch::kPrivateUse1, &vllm_ascend::mega_gdn_decode);
++}
+diff --git a/docs/source/user_guide/feature_guide/mega_gdn_decode.md b/docs/source/user_guide/feature_guide/mega_gdn_decode.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd3be813c1efbc9dcfcf9a28f59c93e4ae4b255a
+--- /dev/null
++++ b/docs/source/user_guide/feature_guide/mega_gdn_decode.md
+@@ -0,0 +1,70 @@
++# MegaGdnDecode for non-speculative Qwen decode
++
++Set `additional_config.ascend_fusion_config.fusion_ops_mega_gdn_decode=true`
++to use the xLLM MegaGdnDecode ACLNN operator on Ascend 950. The default is false.
++The implementation targets pure decode batches with speculative decoding disabled.
++Prefill, mixed batches, and unsupported geometries continue through the existing GDN path.
++
++```bash
++source /path/to/mega_gdn_opp/vendors/custom_mega_gdn_xllm_math/bin/set_env.bash
++vllm serve MODEL --dtype bfloat16 --mamba-ssm-cache-dtype float32 \
++  --additional-config '{"ascend_fusion_config":{"fusion_ops_mega_gdn_decode":true}}'
++```
++
++Merge the fusion field into an existing additional-config object if one is already in use.
++Do not configure speculative decoding for this path.
++
++The fusion includes causal convolution and SiLU, Q/K L2 normalization, gate
++calculation, recurrent state update, and gated RMSNorm. Input and output projections
++remain outside the operator. The framework passes `z` into a mutating custom-op
++boundary and skips the external norm only when the fusion actually ran. KV connector
++wait/save hooks and output-projection prefetch ordering are preserved.
++
++Required geometry and precision:
++
++- One token per live decode request; batch or captured batch size at most 32.
++- Key and value head dimensions 128; convolution width 4, no convolution bias.
++- Local key heads in {1, 2, 4, 8, 16}; value/key head ratio an integer from 1 to 4.
++- BF16 activations, convolution cache and norm weights; FP32 recurrent state.
++- SiLU activation and output gate; RMSNorm epsilon 1e-6 and norm before gate.
++- Conv cache uses SD layout; recurrent cache uses the existing vLLM `[V,K]` layout.
++
++Continuous state pools of at most 1024 slots are passed directly. For block-strided
++state pools or larger pools, a paired Triton gather collects only this batch's
++Conv/SSM rows, MegaGdnDecode updates the compact buffers, and a paired scatter writes
++back live rows. This adds two device kernels. Inner state rows must be contiguous.
++The compact path ignores reserved padding slot zero and preserves physical page gaps.
++No device index values are read back to the CPU.
++
++Build the A5 OPP from xLLM-AI/xllm-ops commit
++`d5694d2248e24902b5a6331aa909b283a38f5bd6` and rebuild `vllm_ascend_C` to register
++`torch.ops._C_ascend.mega_gdn_decode`. A separate OPP prefix avoids replacing an
++existing vendor installation. From the xllm-ops checkout after initializing PTO:
++
++```bash
++git submodule update --init --depth 1 third_party/pto-isa
++cd xllm_ops
++bash build.sh --pkg --ops=mega_gdn_decode --soc=ascend950 \
++  --vendor_name=custom_mega_gdn -j8
++bash build/cann-ops-xllm-custom_mega_gdn_linux-x86_64.run \
++  --install-path=/path/to/mega_gdn_opp
++```
++
++Use the Python/CANN environment of the target worker for building and installation.
++The OPP environment must be sourced before the worker imports the C++ extension.
++
++Verification commands from the vllm-ascend checkout:
++
++```bash
++python -m pytest -q tests/ut/ops/test_mega_gdn_decode.py tests/ut/ops/test_gdn.py
++python -m pytest -q -s \
++  tests/e2e/nightly/single_node/ops/singlecard_ops/test_mega_gdn_decode.py
++python benchmarks/benchmark_mega_gdn_decode.py --batch 4 --key-heads 4 --value-heads 8
++```
++
++The NPU tests cover output and both state caches, contiguous and strided pools,
++padding ownership, graph replay with changing inputs/indices, and twelve consecutive
++steps against the existing FLA decode core. Floating-point rounding differs from
++the original chain, so this is an opt-in integration rather than a bitwise-equivalent
++replacement. Validate model-level accuracy and throughput with production weights
++before choosing it for a workload.
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_mega_gdn_decode.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_mega_gdn_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fc77f0e9fad14c4dc6d3f9027788fe5dc1b7773
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_mega_gdn_decode.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Run after sourcing the MegaGdnDecode OPP environment; one NPU is enough."""
++
++import copy
++import importlib
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm_ascend.ops.mega_gdn_decode import run_mega_gdn_decode, supports_mega_gdn_decode
++
++pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="NPU required")
++
++
++def _case(batch=4, nk=2, nv=4, padded=False):
++    torch.manual_seed(81)
++    torch.npu.set_device(0)
++    importlib.import_module("vllm_ascend.vllm_ascend_C")
++    slots, channels = batch + 3, (2 * nk + nv) * 128
++
++    def rand(shape, scale=0.2, dtype=torch.bfloat16):
++        return (torch.randn(shape) * scale).to(dtype).npu()
++
++    conv_initial = rand((slots, 3, channels))
++    ssm_initial = rand((slots, nv, 128, 128), 0.05, torch.float32)
++
++    def cache(value):
++        if not padded:
++            return value.clone()
++        row = value[0].numel()
++        storage = torch.full((slots, row + 256), 9.0, dtype=value.dtype, device=value.device)
++        view = storage.as_strided(value.shape, (row + 256, *value.stride()[1:]))
++        view.copy_(value)
++        return view
++
++    layer = SimpleNamespace(
++        num_spec=0,
++        head_k_dim=128,
++        head_v_dim=128,
++        conv_kernel_size=4,
++        num_k_heads=nk,
++        num_v_heads=nv,
++        tp_size=1,
++        key_dim=nk * 128,
++        value_dim=nv * 128,
++        activation="silu",
++        conv1d=SimpleNamespace(bias=None),
++        norm=SimpleNamespace(
++            eps=1e-6, norm_before_gate=True, group_size=None, activation="silu", weight=rand((128,), 0.3)
++        ),
++        A_log=rand((nv,), 0.2, torch.float32),
++        _mega_gdn_dt_bias=rand((nv,), 0.2, torch.float32),
++        kv_cache=(cache(conv_initial), cache(ssm_initial)),
++    )
++    layer.dt_bias = layer._mega_gdn_dt_bias
++    indices = torch.arange(batch, 0, -1, dtype=torch.int32).npu()
++    meta = SimpleNamespace(
++        num_prefills=0,
++        num_spec_decodes=0,
++        spec_sequence_masks=None,
++        num_decodes=batch,
++        non_spec_state_indices_tensor=indices,
++    )
++    qkv, z, b, a = rand((batch, channels)), rand((batch, nv, 128)), rand((batch, nv)), rand((batch, nv))
++    weight = rand((4, channels))
++    output = torch.empty_like(z)
++    return layer, meta, qkv, z, b, a, weight, output
++
++
++def _golden(args, conv, state):
++    layer, meta, qkv, z, b, a, weight, _ = args
++    qkv, z, b, a, weight = [x.cpu().float() for x in (qkv, z, b, a, weight)]
++    ids = meta.non_spec_state_indices_tensor.cpu().tolist()
++    nv, nk = layer.num_v_heads, layer.num_k_heads
++    outputs = []
++    for row, slot in enumerate(ids):
++        if slot == 0:
++            outputs.append(torch.zeros(nv, 128, dtype=torch.bfloat16))
++            continue
++        history = conv[slot].float()
++        c = F.silu((history * weight[:3]).sum(0) + qkv[row] * weight[3]).bfloat16().float()
++        conv[slot, :2] = conv[slot, 1:].clone()
++        conv[slot, 2] = qkv[row]
++        q, k, v = c.split([nk * 128, nk * 128, nv * 128])
++        q = q.reshape(nk, 128)
++        k = k.reshape(nk, 128)
++        v = v.reshape(nv, 128)
++        q = (q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6) / 128**0.5).repeat_interleave(nv // nk, 0)
++        k = (k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)).repeat_interleave(nv // nk, 0)
++        decay = (-layer.A_log.cpu().exp() * F.softplus(a[row] + layer.dt_bias.cpu(), threshold=20)).exp()
++        beta = b[row].sigmoid()
++        h = state[slot] * decay[:, None, None]
++        delta = (v - (h * k[:, None, :]).sum(-1)) * beta[:, None]
++        h = h + delta[:, :, None] * k[:, None, :]
++        state[slot] = h
++        o = (h * q[:, None, :]).sum(-1).bfloat16().float()
++        y = o * torch.rsqrt(o.square().mean(-1, keepdim=True) + 1e-6)
++        y = y * layer.norm.weight.cpu().float() * F.silu(z[row])
++        outputs.append(y.bfloat16())
++    return torch.stack(outputs)
++
++
++@pytest.mark.parametrize(
++    "batch,nk,nv,padded", [(1, 1, 1, False), (4, 2, 4, False), (4, 2, 4, True), (16, 4, 12, True), (32, 1, 4, False)]
++)
++def test_output_and_state_against_reference(batch, nk, nv, padded):
++    args = _case(batch, nk, nv, padded)
++    layer = args[0]
++    assert supports_mega_gdn_decode(*args)
++    conv = layer.kv_cache[0].cpu().clone()
++    state = layer.kv_cache[1].cpu().clone()
++    expected = _golden(args, conv, state)
++    run_mega_gdn_decode(*args)
++    torch.npu.synchronize()
++    torch.testing.assert_close(args[-1].cpu(), expected, rtol=0.03, atol=0.012)
++    torch.testing.assert_close(layer.kv_cache[0].cpu(), conv, rtol=0, atol=0)
++    torch.testing.assert_close(layer.kv_cache[1].cpu(), state, rtol=0.003, atol=0.0003)
++
++
++@pytest.mark.parametrize("padded", [False, True])
++def test_graph_replay_changes_inputs_and_indices(padded):
++    args = list(_case(padded=padded))
++    layer, meta = args[:2]
++    for _ in range(2):
++        run_mega_gdn_decode(*args)
++    torch.npu.synchronize()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        run_mega_gdn_decode(*args)
++    torch.npu.synchronize()
++    conv = layer.kv_cache[0].cpu().clone()
++    state = layer.kv_cache[1].cpu().clone()
++    for step in range(5):
++        args[2].copy_((torch.randn(args[2].shape) * 0.2).bfloat16().npu())
++        meta.non_spec_state_indices_tensor.copy_(torch.tensor([2, 4, 1, 3], dtype=torch.int32).npu())
++        expected = _golden(args, conv, state)
++        graph.replay()
++        torch.npu.synchronize()
++        torch.testing.assert_close(args[-1].cpu(), expected, rtol=0.04, atol=0.015)
++        torch.testing.assert_close(layer.kv_cache[0].cpu(), conv, rtol=0, atol=0)
++        torch.testing.assert_close(layer.kv_cache[1].cpu(), state, rtol=0.01, atol=0.0005)
++
++
++def test_padding_preserves_live_cache_and_page_gaps():
++    args = list(_case(padded=True))
++    layer, meta = args[:2]
++    meta.non_spec_state_indices_tensor.copy_(torch.tensor([4, 2, 0, 0], dtype=torch.int32).npu())
++    conv = layer.kv_cache[0].cpu().clone()
++    state = layer.kv_cache[1].cpu().clone()
++    expected = _golden(args, conv, state)
++    run_mega_gdn_decode(*args)
++    torch.npu.synchronize()
++    torch.testing.assert_close(args[-1][:2].cpu(), expected[:2], rtol=0.03, atol=0.012)
++    torch.testing.assert_close(layer.kv_cache[0].cpu(), conv, rtol=0, atol=0)
++    torch.testing.assert_close(layer.kv_cache[1].cpu(), state, rtol=0.003, atol=0.0003)
++    for cache in layer.kv_cache:
++        row = cache[0].numel()
++        stride = cache.stride(0)
++        gaps = cache.as_strided((cache.shape[0], stride - row), (stride, 1), storage_offset=row)
++        assert torch.all(gaps.cpu() == 9.0)
++
++
++def test_against_existing_decode_core(monkeypatch):
++    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
++
++    import vllm_ascend.ops.gdn as gdn
++    from vllm_ascend.ops.gdn_attn_builder import GDNCausalConv1dMetadata, GDNDecodeMetadata
++    from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
++
++    args = list(_case(padded=True))
++    layer, meta = args[:2]
++    baseline = copy.copy(layer)
++    baseline.kv_cache = tuple(t.clone() for t in layer.kv_cache)
++    baseline.prefix = "test.linear_attn"
++    query_start = torch.arange(5, dtype=torch.int32).npu()
++    metadata = GDNAttentionMetadata(
++        num_prefills=0,
++        num_prefill_tokens=0,
++        num_decodes=4,
++        num_decode_tokens=4,
++        num_spec_decodes=0,
++        num_spec_decode_tokens=0,
++        num_actual_tokens=4,
++        spec_sequence_masks=None,
++        non_spec_state_indices_tensor=meta.non_spec_state_indices_tensor,
++        non_spec_query_start_loc=query_start,
++    )
++    metadata.non_spec_decode_metadata = GDNDecodeMetadata(
++        causal_conv1d=GDNCausalConv1dMetadata(
++            query_start_loc=query_start, cache_indices=meta.non_spec_state_indices_tensor, initial_state_mode=None
++        ),
++        actual_seq_lengths=torch.tensor([0, 1, 1, 1, 1], dtype=torch.int32).npu(),
++    )
++    monkeypatch.setattr(gdn, "get_forward_context", lambda: SimpleNamespace(attn_metadata={baseline.prefix: metadata}))
++    monkeypatch.setattr(gdn, "get_weight_prefetch_method", lambda: None)
++    monkeypatch.setattr(gdn, "wait_for_kv_layer_from_connector", lambda *args: None)
++    monkeypatch.setattr(gdn, "record_attention_compute_start", lambda: None)
++    monkeypatch.setattr(gdn, "maybe_save_kv_layer_to_connector", lambda *args: None)
++    monkeypatch.setattr(gdn, "_get_packed_conv_weights", lambda layer: args[6])
++    monkeypatch.setattr(gdn, "_gate_norm_fusion_enabled", lambda: False)
++    monkeypatch.setattr(gdn.DeviceOperator, "fused_gdn_gating", fused_gdn_gating_patch)
++    original_out = torch.zeros_like(args[-1])
++    for step in range(12):
++        args[2].copy_((torch.randn(args[2].shape) * 0.2).bfloat16().npu())
++        gdn.AscendGatedDeltaNetAttention._forward_core(baseline, args[2], args[4], args[5], original_out)
++        o = original_out.float()
++        expected = (
++            o
++            * torch.rsqrt(o.square().mean(-1, keepdim=True) + 1e-6)
++            * layer.norm.weight.float()
++            * F.silu(args[3].float())
++        ).bfloat16()
++        run_mega_gdn_decode(*args)
++        torch.npu.synchronize()
++        delta = (args[-1].float() - expected.float()).abs()
++        cosine = F.cosine_similarity(args[-1].float().flatten(), expected.float().flatten(), dim=0)
++        print("BASELINE", step, "max_abs", delta.max().item(), "cosine", cosine.item())
++        torch.testing.assert_close(args[-1].cpu(), expected.cpu(), rtol=0.05, atol=0.025)
++        torch.testing.assert_close(layer.kv_cache[0], baseline.kv_cache[0], rtol=0, atol=0)
++        torch.testing.assert_close(layer.kv_cache[1], baseline.kv_cache[1], rtol=0.05, atol=0.004)
++        assert cosine.item() > 0.999
+diff --git a/tests/ut/ops/test_mega_gdn_decode.py b/tests/ut/ops/test_mega_gdn_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7a0f5b0b24d23954605ee046f88f03bb2e9b18c
+--- /dev/null
++++ b/tests/ut/ops/test_mega_gdn_decode.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++import vllm_ascend.ops.mega_gdn_decode as mega
++
++
++def make_case(batch=4):
++    nk, nv, channels, slots = 2, 4, 1024, 8
++    layer = SimpleNamespace(
++        num_spec=0,
++        head_k_dim=128,
++        head_v_dim=128,
++        conv_kernel_size=4,
++        num_k_heads=nk,
++        num_v_heads=nv,
++        tp_size=1,
++        activation="silu",
++        conv1d=SimpleNamespace(bias=None),
++        norm=SimpleNamespace(
++            eps=1e-6,
++            norm_before_gate=True,
++            group_size=None,
++            activation="silu",
++            weight=torch.ones(128, dtype=torch.bfloat16),
++        ),
++        A_log=torch.zeros(nv),
++        _mega_gdn_dt_bias=torch.zeros(nv),
++        kv_cache=(torch.zeros(slots, 3, channels, dtype=torch.bfloat16), torch.zeros(slots, nv, 128, 128)),
++    )
++    meta = SimpleNamespace(
++        num_prefills=0,
++        num_spec_decodes=0,
++        spec_sequence_masks=None,
++        num_decodes=batch,
++        non_spec_state_indices_tensor=torch.arange(1, batch + 1, dtype=torch.int32),
++    )
++    qkv = torch.zeros(batch, channels, dtype=torch.bfloat16)
++    z = torch.zeros(batch, nv, 128, dtype=torch.bfloat16)
++    b = torch.zeros(batch, nv, dtype=torch.bfloat16)
++    weight = torch.zeros(4, channels, dtype=torch.bfloat16)
++    return layer, meta, qkv, z, b, b.clone(), weight, torch.zeros_like(z)
++
++
++def test_supported_and_padded_page_state_layouts():
++    args = make_case()
++    assert mega.supports_mega_gdn_decode(*args)
++    layer = args[0]
++    conv, ssm = layer.kv_cache
++    conv = torch.empty_strided(conv.shape, (conv[0].numel() + 64, *conv.stride()[1:]), dtype=conv.dtype)
++    ssm = torch.empty_strided(ssm.shape, (ssm[0].numel() + 64, *ssm.stride()[1:]), dtype=ssm.dtype)
++    layer.kv_cache = conv, ssm
++    assert mega.supports_mega_gdn_decode(*args)
++
++
++@pytest.mark.parametrize("field,value", [("num_spec", 1), ("head_k_dim", 64), ("activation", "relu")])
++def test_unsupported_model_keeps_old_path(field, value):
++    args = make_case()
++    setattr(args[0], field, value)
++    assert not mega.supports_mega_gdn_decode(*args)
++
++
++@pytest.mark.parametrize("field,value", [("num_prefills", 1), ("num_spec_decodes", 1), ("num_decodes", 0)])
++def test_mixed_speculative_or_idle_batches_keep_old_path(field, value):
++    args = make_case()
++    setattr(args[1], field, value)
++    assert not mega.supports_mega_gdn_decode(*args)
++
++
++def test_batch_and_dtype_guards():
++    assert not mega.supports_mega_gdn_decode(*make_case(33))
++    args = list(make_case())
++    args[2] = args[2].float()
++    assert not mega.supports_mega_gdn_decode(*args)
++
++
++@pytest.mark.parametrize("fused", [True, False])
++def test_output_norm_applied_exactly_once(monkeypatch, fused):
++    args = make_case()
++    layer, _, qkv, z, b, a, _, output = args
++    layer.norm = Mock(side_effect=lambda x, gate: x + 3)
++
++    def core(qkv, b, a, output, mega_z=None):
++        output.fill_(7 if fused else 4)
++        return fused
++
++    layer._forward_core = core
++    monkeypatch.setattr(mega, "get_forward_context", lambda: SimpleNamespace(no_compile_layers={"layer": layer}))
++    monkeypatch.setattr(mega, "get_weight_prefetch_method", lambda: None)
++    mega.ascend_gdn_core_with_norm(qkv, z, b, a, output, "layer")
++    assert torch.all(output == 7)
++    assert layer.norm.call_count == (0 if fused else 1)
++
++
++def test_bias_repack_keeps_pointer_after_reload():
++    layer = torch.nn.Module()
++    layer.register_parameter("dt_bias", torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16)))
++    mega.prepare_mega_gdn_weights(layer)
++    ptr = layer._mega_gdn_dt_bias.data_ptr()
++    with torch.no_grad():
++        layer.dt_bias.fill_(3)
++    mega.prepare_mega_gdn_weights(layer)
++    assert layer._mega_gdn_dt_bias.data_ptr() == ptr
++    assert layer._mega_gdn_dt_bias.dtype == torch.float32
++    assert torch.equal(layer._mega_gdn_dt_bias, torch.tensor([3.0, 3.0]))
+diff --git a/vllm_ascend/ops/mega_gdn_decode.py b/vllm_ascend/ops/mega_gdn_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..650dba8eea452117ba3ccc012f3d564c1aca95de
+--- /dev/null
++++ b/vllm_ascend/ops/mega_gdn_decode.py
+@@ -0,0 +1,282 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++"""Non-speculative GDN decode using xLLM's MegaGdnDecode ACLNN operator."""
++
++import math
++from importlib import import_module
++
++import torch
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++from vllm_ascend.utils import get_weight_prefetch_method, is_950
++
++HEAD_DIM = 128
++CONV_HISTORY = 3
++MAX_BATCH_SIZE = 32
++MAX_CACHE_SLOTS = 1024
++STATE_IO_BLOCK = 1024
++NORM_EPS = 1e-6
++logger = init_logger(__name__)
++
++
++def mega_gdn_decode_enabled() -> bool:
++    # Configuration is immutable for a worker's lifetime.
++    from vllm_ascend.ascend_config import get_ascend_config
++
++    try:
++        config = get_ascend_config()
++    except RuntimeError:
++        # Standalone layer utilities can run before worker configuration.
++        return False
++    return config.ascend_fusion_config.fusion_ops_mega_gdn_decode and is_950()
++
++
++@torch.no_grad()
++def prepare_mega_gdn_weights(layer: torch.nn.Module) -> None:
++    """Refresh the FP32 bias after loading, including layerwise reload."""
++    if not hasattr(layer, "dt_bias") or layer.dt_bias.is_meta:
++        return
++    if layer.dt_bias.device.type == "npu":
++        # Load only after device selection, before any graph capture.
++        import_module("vllm_ascend.vllm_ascend_C")
++        if not hasattr(torch.ops._C_ascend, "mega_gdn_decode"):
++            raise RuntimeError("Rebuild vllm_ascend_C to enable MegaGdnDecode")
++    source = layer.dt_bias.detach().float().contiguous()
++    name = "_mega_gdn_dt_bias"
++    current = getattr(layer, name, None)
++    if current is not None and current.shape == source.shape and current.device == source.device:
++        current.copy_(source)
++    else:
++        layer.register_buffer(name, source.clone(), persistent=False)
++
++
++def supports_mega_gdn_decode(layer, metadata, qkv, z, b, a, conv_weight, output) -> bool:
++    """Only inspect host metadata; never synchronize device indices."""
++    if (
++        layer.num_spec != 0
++        or metadata.num_prefills != 0
++        or metadata.num_spec_decodes != 0
++        or metadata.spec_sequence_masks is not None
++        or metadata.num_decodes <= 0
++        or layer.head_k_dim != HEAD_DIM
++        or layer.head_v_dim != HEAD_DIM
++        or layer.conv_kernel_size != CONV_HISTORY + 1
++        or layer.conv1d.bias is not None
++        or layer.activation not in ("silu", "swish")
++        or layer.norm.eps != NORM_EPS
++        or not layer.norm.norm_before_gate
++        or layer.norm.group_size is not None
++        or getattr(layer.norm, "activation", "silu") not in ("silu", "swish")
++    ):
++        return False
++    batch, channels = qkv.shape
++    nk = layer.num_k_heads // layer.tp_size
++    nv = layer.num_v_heads // layer.tp_size
++    if (
++        not 1 <= batch <= MAX_BATCH_SIZE
++        or nk not in (1, 2, 4, 8, 16)
++        or nv % nk != 0
++        or not 1 <= nv // nk <= 4
++        or channels != (2 * nk + nv) * HEAD_DIM
++        or z.shape != (batch, nv, HEAD_DIM)
++        or b.shape != (batch, nv)
++        or a.shape != b.shape
++        or conv_weight.shape != (CONV_HISTORY + 1, channels)
++        or layer.norm.weight.shape != (HEAD_DIM,)
++        or layer.A_log.shape != (nv,)
++    ):
++        return False
++    conv, ssm = layer.kv_cache
++    indices = metadata.non_spec_state_indices_tensor
++    bias = getattr(layer, "_mega_gdn_dt_bias", None)
++    if (
++        conv.ndim != 3
++        or conv.shape[1:] != (CONV_HISTORY, channels)
++        or ssm.shape != (conv.shape[0], nv, HEAD_DIM, HEAD_DIM)
++        or conv.shape[0] == 0
++        or conv.dtype != torch.bfloat16
++        or ssm.dtype != torch.float32
++        or layer.A_log.dtype != torch.float32
++        or bias is None
++        or bias.shape != (nv,)
++        or bias.dtype != torch.float32
++        or indices is None
++        or indices.ndim != 1
++        or indices.numel() < batch
++        or indices.dtype not in (torch.int32, torch.int64)
++        or output.shape[1:] != z.shape[1:]
++        or output.shape[0] < batch
++        or not output.is_contiguous()
++    ):
++        return False
++    tensors = (qkv, z, b, a, conv_weight, layer.norm.weight, output)
++    if any(t.dtype != torch.bfloat16 for t in tensors):
++        return False
++    if any(t.device != qkv.device for t in (*tensors, conv, ssm, indices, bias, layer.A_log)):
++        return False
++    # Padded physical pages are supported; inner row layouts must be dense.
++    return all(t[0].is_contiguous() and t.stride(0) >= math.prod(t.shape[1:]) for t in (conv, ssm))
++
++
++@triton.jit
++def _copy_decode_states(
++    conv,
++    ssm,
++    indices,
++    compact_conv,
++    compact_ssm,
++    compact_indices,
++    conv_stride: tl.int64,
++    ssm_stride: tl.int64,
++    indices_stride,
++    slots,
++    conv_size: tl.constexpr,
++    ssm_size: tl.constexpr,
++    STORE: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    request = tl.program_id(1)
++    tile = tl.program_id(0)
++    offset = tile * BLOCK + tl.arange(0, BLOCK)
++    slot = tl.load(indices + request * indices_stride).to(tl.int64)
++    # Block zero is the model runner's dedicated graph-padding slot.
++    live = (slot > 0) & (slot < slots)
++    conv_mask = offset < conv_size
++    ssm_mask = offset < ssm_size
++    if STORE:
++        cv = tl.load(compact_conv + request * conv_size + offset, conv_mask, other=0)
++        sv = tl.load(compact_ssm + request * ssm_size + offset, ssm_mask, other=0)
++        tl.store(conv + slot * conv_stride + offset, cv, conv_mask & live)
++        tl.store(ssm + slot * ssm_stride + offset, sv, ssm_mask & live)
++    else:
++        cv = tl.load(conv + slot * conv_stride + offset, conv_mask & live, other=0)
++        sv = tl.load(ssm + slot * ssm_stride + offset, ssm_mask & live, other=0)
++        tl.store(compact_conv + request * conv_size + offset, cv, conv_mask)
++        tl.store(compact_ssm + request * ssm_size + offset, sv, ssm_mask)
++        if tile == 0:
++            tl.store(compact_indices + request, request)
++
++
++def run_mega_gdn_decode(layer, metadata, qkv, z, b, a, conv_weight, output) -> None:
++    """Run after eligibility checks and KV connector waits; mutate live caches."""
++    conv, ssm = layer.kv_cache
++    batch = qkv.shape[0]
++    indices = metadata.non_spec_state_indices_tensor[:batch]
++    compact = not (conv.is_contiguous() and ssm.is_contiguous() and conv.shape[0] <= MAX_CACHE_SLOTS)
++    logger.info_once("Using MegaGdnDecode for non-speculative pure decode (compact state cache: %s).", compact)
++    if compact:
++        conv_arg = torch.empty((batch, *conv.shape[1:]), dtype=conv.dtype, device=conv.device)
++        ssm_arg = torch.empty((batch, *ssm.shape[1:]), dtype=ssm.dtype, device=ssm.device)
++        index_arg = torch.empty(batch, dtype=torch.int32, device=qkv.device)
++        conv_size, ssm_size = math.prod(conv.shape[1:]), math.prod(ssm.shape[1:])
++        grid = (triton.cdiv(max(conv_size, ssm_size), STATE_IO_BLOCK), batch)
++        _copy_decode_states[grid](
++            conv,
++            ssm,
++            indices,
++            conv_arg,
++            ssm_arg,
++            index_arg,
++            conv.stride(0),
++            ssm.stride(0),
++            indices.stride(0),
++            conv.shape[0],
++            conv_size,
++            ssm_size,
++            STORE=False,
++            BLOCK=STATE_IO_BLOCK,
++        )
++    else:
++        conv_arg, ssm_arg = conv, ssm
++        index_arg = indices.to(torch.int32).contiguous()
++    conv_out = torch.empty_like(qkv, memory_format=torch.contiguous_format)
++    torch.ops._C_ascend.mega_gdn_decode(
++        qkv.contiguous(),
++        z.contiguous(),
++        b.contiguous(),
++        a.contiguous(),
++        conv_weight.contiguous(),
++        conv_arg,
++        layer.A_log.contiguous(),
++        layer._mega_gdn_dt_bias,
++        ssm_arg,
++        index_arg,
++        index_arg,
++        layer.norm.weight.contiguous(),
++        conv_out,
++        output[:batch],
++        False,
++    )
++    if compact:
++        _copy_decode_states[grid](
++            conv,
++            ssm,
++            indices,
++            conv_arg,
++            ssm_arg,
++            index_arg,
++            conv.stride(0),
++            ssm.stride(0),
++            indices.stride(0),
++            conv.shape[0],
++            conv_size,
++            ssm_size,
++            STORE=True,
++            BLOCK=STATE_IO_BLOCK,
++        )
++
++
++def ascend_gdn_core_with_norm(
++    qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor, output: torch.Tensor, layer_name: str
++) -> None:
++    layer = get_forward_context().no_compile_layers[layer_name]
++    fused = layer._forward_core(qkv, b, a, output, mega_z=z)
++    method = get_weight_prefetch_method()
++    ratio = float(method.attn.prefetch_ratio.get("o", 0)) if method is not None and method.attn.enable else 0.0
++    if fused:
++        # The usual gated-norm op owns this join; mega already did the norm.
++        from vllm_ascend.ops.mlp_weight_prefetch import MLP_PREFETCH_TOKEN_THRESHOLD, _finish_prefetch, _prefetch_size
++        from vllm_ascend.utils import prefetch_stream
++
++        if (
++            ratio > 0
++            and _prefetch_size(layer.out_proj.weight, ratio) > 0
++            and 0 < qkv.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD
++        ):
++            _finish_prefetch(prefetch_stream())
++    else:
++        flat = output.reshape(-1, output.shape[-1])
++        z_flat = z.reshape(-1, z.shape[-1])
++        if ratio > 0:
++            result = torch.ops.vllm.prefetch_gated_norm(
++                flat,
++                z_flat,
++                layer.norm.weight,
++                layer.out_proj.weight,
++                layer.norm.eps,
++                -1 if layer.norm.group_size is None else layer.norm.group_size,
++                layer.norm.norm_before_gate,
++                ratio,
++                qkv.shape[0],
++            )
++        else:
++            result = layer.norm(flat, z_flat)
++        output.copy_(result.reshape_as(output))
++
++
++def _ascend_gdn_core_with_norm_fake(
++    qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor, output: torch.Tensor, layer_name: str
++) -> None:
++    return None
++
++
++direct_register_custom_op(
++    op_name="ascend_gdn_core_with_norm",
++    op_func=ascend_gdn_core_with_norm,
++    mutates_args=["output"],
++    fake_impl=_ascend_gdn_core_with_norm_fake,
++)
+
