@@ -189,10 +189,14 @@ class AscendFusionConfig:
             (``vllm_ascend/ops/triton/fused_gdn_gating_l2norm.py``). The fused
             kernel mirrors one specific ``l2norm_fwd`` backend bit for bit and
             is skipped when ``USE_DEFAULT_FLA_NORM`` selects another one.
+        fusion_ops_mega_gdn_decode: Use the xLLM MegaGdnDecode operator for
+            BF16, non-speculative, pure decode batches on Ascend 950. Requires
+            the custom OPP package; unsupported batches keep the existing path.
     """
 
     fusion_ops_gmmswigluquant: bool = True
     fusion_ops_gdn_gate_norm: bool = False
+    fusion_ops_mega_gdn_decode: bool = False
 
 
 @config(config=ConfigDict(frozen=True))
@@ -474,7 +478,8 @@ class AscendConfig:
             },
             "ascend_fusion_config": {
                 "fusion_ops_gmmswigluquant": true,
-                "fusion_ops_gdn_gate_norm": false
+                "fusion_ops_gdn_gate_norm": false,
+                "fusion_ops_mega_gdn_decode": false
             },
             "ascend_warmup_config": {
                 "enable_early_kernel_warmup": false,
@@ -652,9 +657,7 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
-    weight_prefetch_config: Any = dataclasses.field(
-        default_factory=lambda: WeightPrefetchConfig({})
-    )
+    weight_prefetch_config: Any = dataclasses.field(default_factory=lambda: WeightPrefetchConfig({}))
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1523,6 +1526,7 @@ class XliteGraphConfig:
                 vllm_config.cache_config.block_size,
             )
 
+
 class WeightPrefetchConfig:
     """Configuration Object for weight_prefetch_config from additional_config"""
 
@@ -1535,6 +1539,7 @@ class WeightPrefetchConfig:
     def __init__(self, weight_prefetch_config: dict):
         self.enabled = weight_prefetch_config.get("enabled", False)
         self.prefetch_ratio = weight_prefetch_config.get("prefetch_ratio", self.prefetch_ratio)
+
 
 @config
 class ProfilingChunkConfig:
@@ -1973,11 +1978,10 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         raw_weight_prefetch = {}
     elif not isinstance(raw_weight_prefetch, dict):
         raise ValueError(
-            f"additional_config.weight_prefetch_config must be a dict, "
-            f"got {type(raw_weight_prefetch).__name__}."
+            f"additional_config.weight_prefetch_config must be a dict, got {type(raw_weight_prefetch).__name__}."
         )
     weight_prefetch_config = WeightPrefetchConfig(raw_weight_prefetch)
-    
+
     new_config = AscendConfig(  # type: ignore[call-arg]
         scheduler_config=sched,
         sparse_kv_offload_config=sparse_kv,

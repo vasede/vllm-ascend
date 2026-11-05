@@ -46,6 +46,12 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
+from vllm_ascend.ops.mega_gdn_decode import (
+    mega_gdn_decode_enabled,
+    prepare_mega_gdn_weights,
+    run_mega_gdn_decode,
+    supports_mega_gdn_decode,
+)
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
@@ -155,6 +161,8 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
     def process_weights_and_pack(*args, **kwargs):
         result = process_weights_after_loading(*args, **kwargs)
         _pack_conv_weights(conv1d)
+        if mega_gdn_decode_enabled():
+            prepare_mega_gdn_weights(layer)
         return result
 
     quant_method.process_weights_after_loading = process_weights_and_pack
@@ -482,6 +490,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
+        if mega_gdn_decode_enabled() and self.num_spec == 0:
+            torch.ops.vllm.ascend_gdn_core_with_norm(mixed_qkv, z, b, a, core_attn_out, self.prefix)
+            out, _ = self.out_proj(core_attn_out.flatten(-2))
+            if output is not None:
+                output[:num_tokens] = out
+            return out
+
         torch.ops.vllm.qwen_gdn_attention_core(
             mixed_qkv,
             b,
@@ -533,6 +548,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        mega_z: torch.Tensor | None = None,
     ):
         """
         Core attention computation (called by custom op).
@@ -579,6 +595,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1. Convolution sequence transformation
         conv_weights_T = _get_packed_conv_weights(self)
+        if mega_z is not None:
+            z_decode = mega_z[:num_actual_tokens]
+            if supports_mega_gdn_decode(self, attn_metadata, mixed_qkv, z_decode, b, a, conv_weights_T, core_attn_out):
+                run_mega_gdn_decode(self, attn_metadata, mixed_qkv, z_decode, b, a, conv_weights_T, core_attn_out)
+                maybe_save_kv_layer_to_connector("", [])
+                return True
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
