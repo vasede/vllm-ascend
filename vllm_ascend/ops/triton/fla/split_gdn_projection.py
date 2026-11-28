@@ -99,6 +99,15 @@ def split_gdn_projection(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = qkvz.shape[0]
     ba_half = ba.shape[-1] // 2
+    if num_tokens == 1 and qkvz.stride(-1) == 1 and ba.stride(-1) == 1:
+        # Each slice of a single contiguous row is itself contiguous. Keep
+        # the projections as views and avoid four allocations and a copy kernel.
+        mixed_qkv = qkvz.narrow(-1, 0, qkv_dim)
+        z = qkvz.narrow(-1, qkv_dim, z_dim).reshape(1, z_dim // head_v_dim, head_v_dim)
+        b = ba.narrow(-1, 0, ba_half)
+        a = ba.narrow(-1, ba_half, ba_half)
+        return mixed_qkv, z, b, a
+
     mixed_qkv = torch.empty((num_tokens, qkv_dim), device=qkvz.device, dtype=qkvz.dtype)
     z = torch.empty((num_tokens, z_dim // head_v_dim, head_v_dim), device=qkvz.device, dtype=qkvz.dtype)
     b = torch.empty((num_tokens, ba_half), device=ba.device, dtype=ba.dtype)
